@@ -37,7 +37,7 @@ on:
         type: boolean
         default: false
       artifact-name:
-        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once"
+        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once. Also used as the SARIF category"
         type: string
         default: sast-report
       rulesets:
@@ -180,7 +180,8 @@ jobs:
           # Semgrep can finish with partial results (rule or parse errors).
           errors="$(jq '(.errors // []) | length' "$report")"
           if [ "$errors" -gt 0 ]; then
-            kinds="$(jq -r '[(.errors // [])[] | (.type | tostring)] | unique | join(", ")' "$report" | tr -c 'A-Za-z0-9_, "[]-' '?')"
+            kinds_raw="$(jq -r '[(.errors // [])[] | (.type | tostring)] | unique | join(", ")' "$report")"
+            kinds="$(printf '%s' "$kinds_raw" | tr -c 'A-Za-z0-9_, "[]-' '?')"
             echo "::warning::Semgrep reported $errors error(s) ($kinds); results may be partial. See the report artifact."
           fi
 

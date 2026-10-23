@@ -37,7 +37,7 @@ on:
         type: boolean
         default: false
       artifact-name:
-        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once"
+        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once. Also used as the SARIF category"
         type: string
         default: sca-report
       ignore-path:
@@ -167,10 +167,10 @@ jobs:
           # Resolution problems mean the dependency list may be incomplete (for
           # example Maven parents/BOMs from private repositories, which are not
           # resolved), which would otherwise look like a clean result.
-          pattern="${tab}(WARN|ERROR)${tab}|\[pom\] (Failed to fetch|Parent POM not found)|was not found in local/remote"
+          pattern="\[pom\] (Failed to fetch|Parent POM not found)|was not found in local/remote|${tab}(WARN|ERROR)${tab}.*([Ff]ailed to|not found|\[pom\])"
           if grep -q -E "$pattern" "$log"; then
             echo "::warning::Trivy reported resolution problems; the dependency list may be incomplete (only public Maven Central is resolved). First messages follow."
-            grep -E "$pattern" "$log" | cut -c1-300 | sort -u | head -10 | while IFS= read -r line; do
+            grep -E "$pattern" "$log" | cut -c1-300 | sort -u | sed -n "1,10p" | while IFS= read -r line; do
               echo "::warning::Trivy: ${line//[$'\r\n']/ }"
             done
           fi
