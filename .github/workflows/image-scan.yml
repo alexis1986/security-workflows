@@ -107,11 +107,11 @@ on:
         type: string
         default: scan-image
       push:
-        description: "Push the scanned image to the registry after the policy step passes (needs packages: write; ghcr.io only login). Requires push-tags"
+        description: "Push the scanned image to the registry after the policy step passes (needs packages: write; ghcr.io only). Requires push-tags"
         type: boolean
         default: false
       push-tags:
-        description: "Newline-separated full image references to push, e.g. ghcr.io/owner/name:latest. Required when push is true"
+        description: "Newline-separated ghcr.io image references to push (ghcr.io/<owner>/<repo>:<tag>, lowercase), e.g. ghcr.io/owner/name:latest. Required when push is true"
         type: string
         default: ""
     secrets:
@@ -188,7 +188,7 @@ jobs:
             true|false) ;;
             *) echo "::error::Invalid push '$PUSH' (expected 'true' or 'false')"; exit 1 ;;
           esac
-          ref_re='^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+          ref_re='^ghcr[.]io/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)+:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
           count=0
           while IFS= read -r ref; do
             ref="${ref%$'\r'}"
@@ -196,7 +196,7 @@ jobs:
             ref="${ref%"${ref##*[![:space:]]}"}"
             [ -z "$ref" ] && continue
             if ! grep -Eq "$ref_re" <<< "$ref"; then
-              echo "::error::push-tags entry is not a valid lowercase image reference with a tag (registry/repo:tag): '${ref//[^A-Za-z0-9._:\/-]/?}'"
+              echo "::error::push-tags entries must be ghcr.io/<owner>/<repo>:<tag> in lowercase (only ghcr.io is supported): '${ref//[^A-Za-z0-9._:\/-]/?}'"
               exit 1
             fi
             count=$((count + 1))

@@ -528,8 +528,8 @@ jobs:
           expect no  "image: validate rejects push=true with only blank tags" env "${base_env[@]}" PUSH=true PUSH_TAGS=$'\n  \n' bash "$iv"
           expect no  "image: validate rejects an invalid push value" env "${base_env[@]}" PUSH=maybe PUSH_TAGS= bash "$iv"
           expect yes "image: validate accepts several valid push-tags" \
-            env "${base_env[@]}" PUSH=true PUSH_TAGS=$'ghcr.io/owner/my-app:latest\nghcr.io/owner/my-app:sha-0123abc\n\nlocalhost:5000/team/app:1.2.3\n' bash "$iv"
-          for bad in "ghcr.io/Owner/app:latest" "ghcr.io/owner/app" "ghcr.io/owner/app:" "app:latest" 'ghcr.io/owner/app:t;id' 'ghcr.io/owner/app:a b' "ghcr.io//app:t" "ghcr.io/owner/app/:t" "ghcr.io/owner/../app:t" "https://ghcr.io/owner/app:t" "ghcr.io/owner/app@sha256:abc"; do
+            env "${base_env[@]}" PUSH=true PUSH_TAGS=$'ghcr.io/owner/my-app:latest\nghcr.io/owner/my-app:sha-0123abc\n\nghcr.io/owner/team/app:1.2.3\n' bash "$iv"
+          for bad in "owner/name:tag" "docker.io/library/x:1" "localhost:5000/team/app:1" "registry.example.com/o/app:1" "ghcrxio/o/app:1" "ghcr.io/app:1" "ghcr.io/Owner/app:latest" "ghcr.io/owner/app" "ghcr.io/owner/app:" "app:latest" 'ghcr.io/owner/app:t;id' 'ghcr.io/owner/app:a b' "ghcr.io//app:t" "ghcr.io/owner/app/:t" "ghcr.io/owner/../app:t" "https://ghcr.io/owner/app:t" "ghcr.io/owner/app@sha256:abc"; do
             expect no "image: validate rejects push-tag '$bad'" \
               env "${base_env[@]}" PUSH=true PUSH_TAGS=$'ghcr.io/owner/ok:latest\n'"$bad" bash "$iv"
           done

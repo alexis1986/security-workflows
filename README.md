@@ -180,7 +180,7 @@ jobs:
 Outputs besides the counts: `image-id` (ID of the scanned image) and `digest`
 (repo digest of the pushed image, empty when nothing was pushed). Pass
 `needs.image-scan.outputs.digest` to the signing and SBOM job. `push-tags`
-entries must be full lowercase references with a tag (`registry/repo:tag`).
+entries must be lowercase `ghcr.io/<owner>/<repo>:<tag>` references: only ghcr.io is supported (any other registry or a bare `owner/name:tag` is rejected).
 
 The image is built with `push: false` and `load: true`, exported to a tarball and
 scanned with `trivy image --input` (the Docker socket is never mounted into the
