@@ -1,0 +1,10 @@
+# Config for scanning this repository itself (git history scan with scan-path '.').
+# Gitleaks picks it up automatically from the scan root.
+title = "security-workflows"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Intentionally fake test fixtures"
+paths = ['''^fixtures/''']

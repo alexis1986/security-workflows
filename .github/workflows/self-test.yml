@@ -1,0 +1,70 @@
+name: self-test
+
+# Self-test for the reusable workflows in this repository.
+#
+# Every reusable workflow exposes the same interface (inputs: mode, scan-path,
+# upload-sarif; outputs: blocking-count, total-count). Each layer is exercised
+# against two fixture sets, always with `mode: report` so a finding never fails
+# the call itself:
+#
+#   fixtures/vulnerable/<layer>  -> must produce blocking-count >= 1
+#   fixtures/clean/<layer>       -> must produce blocking-count == 0
+#
+# To add a layer (for example `sca`):
+#   1. Add fixtures under fixtures/vulnerable/sca and fixtures/clean/sca.
+#   2. Copy the two `call-<layer>-*` jobs below and change `uses:` and `scan-path`.
+#   3. Copy the `assert-<layer>` job, point `needs:` at the new call jobs and
+#      adjust the output references.
+#
+# Naming: call-<layer>-<case> calls the workflow, assert-<layer> checks outputs.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- secrets
+  call-secrets-vulnerable:
+    # security-events: write is required because the called workflow declares it
+    # (used only when upload-sarif is true).
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/secrets.yml
+    with:
+      mode: report
+      scan-path: fixtures/vulnerable/secrets
+
+  call-secrets-clean:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/secrets.yml
+    with:
+      mode: report
+      scan-path: fixtures/clean/secrets
+
+  assert-secrets:
+    needs: [call-secrets-vulnerable, call-secrets-clean]
+    runs-on: ubuntu-latest
+    env:
+      VULNERABLE_BLOCKING: ${{ needs.call-secrets-vulnerable.outputs.blocking-count }}
+      CLEAN_BLOCKING: ${{ needs.call-secrets-clean.outputs.blocking-count }}
+    steps:
+      - name: Assert expected counts
+        run: |
+          set -euo pipefail
+          fail=0
+          echo "vulnerable blocking-count: '$VULNERABLE_BLOCKING' (expected >= 1)"
+          echo "clean blocking-count:      '$CLEAN_BLOCKING' (expected 0)"
+          case "$VULNERABLE_BLOCKING" in ''|*[!0-9]*) echo "::error::vulnerable blocking-count is not numeric"; fail=1 ;;
+            *) [ "$VULNERABLE_BLOCKING" -ge 1 ] || { echo "::error::Gitleaks found nothing in the vulnerable fixture (false green)"; fail=1; } ;;
+          esac
+          case "$CLEAN_BLOCKING" in ''|*[!0-9]*) echo "::error::clean blocking-count is not numeric"; fail=1 ;;
+            *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Gitleaks reported findings in the clean fixture"; fail=1; } ;;
+          esac
+          exit "$fail"
