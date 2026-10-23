@@ -7,7 +7,11 @@ name: iac
 # - Optional `helm-chart`: the chart is rendered with `helm template` (default
 #   values; the chart must render without extra input and its dependencies must
 #   be vendored) and the rendered manifests are scanned too. Findings are
-#   reported against the chart path.
+#   reported against the chart path. The chart directory is excluded from the
+#   main scan (Trivy would otherwise render it a second time), so each chart
+#   finding is counted once. Line numbers of Helm findings refer to the
+#   rendered manifest, not to the template file, so they can differ from the
+#   template source. The same ignore file applies to both scans.
 # - total-count    : misconfigurations of every severity.
 # - blocking-count : CRITICAL or HIGH misconfigurations. Misconfigurations have no
 #                    "fixed version", so every CRITICAL/HIGH finding blocks.
@@ -158,6 +162,36 @@ jobs:
               ignore=(--ignorefile "/repo/$IGNORE_PATH") ;;
           esac
 
+          # Targets are relative to the scanned directory; make them
+          # repository-relative so the report, the summary and the SARIF all
+          # point at real files.
+          prefix="${SCAN_PATH#./}"
+          prefix="${prefix%/}"
+          if [ "$prefix" = "." ] || [ -z "$prefix" ]; then prefix=""; fi
+
+          # Helm: render first. Trivy renders charts natively too, so the chart
+          # directory is skipped in the main scan and counted once, from the
+          # rendered output.
+          helm_json="$RUNNER_TEMP/helm-scan/helm.json"
+          hprefix=""
+          skip=()
+          if [ -n "$HELM_CHART" ]; then
+            hprefix="${HELM_CHART#./}"
+            hprefix="${hprefix%/}"
+            if [ "$hprefix" = "." ]; then hprefix=""; fi
+            if [ ! -f "$GITHUB_WORKSPACE/${hprefix:+$hprefix/}Chart.yaml" ]; then
+              echo "::error::helm-chart '$HELM_CHART' does not contain a Chart.yaml"
+              exit 1
+            fi
+            rendered="$RUNNER_TEMP/helm-rendered"
+            mkdir -p "$rendered" "$RUNNER_TEMP/helm-scan"
+            if ! helm template "$GITHUB_WORKSPACE/${hprefix:-.}" --output-dir "$rendered" > /dev/null; then
+              echo "::error::helm template failed for '$HELM_CHART' (the chart must render with its default values and have its dependencies vendored)"
+              exit 1
+            fi
+            skip=(--skip-dirs "/repo${hprefix:+/$hprefix}")
+          fi
+
           # Full report (all severities); the blocking policy is applied when parsing.
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
@@ -166,39 +200,22 @@ jobs:
             config \
             --exit-code 0 \
             "${ignore[@]}" \
+            "${skip[@]}" \
             --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output /out/trivy.json \
             "/repo/$SCAN_PATH"
 
-          # Targets are relative to the scanned directory; make them
-          # repository-relative so the report, the summary and the SARIF all
-          # point at real files.
-          prefix="${SCAN_PATH#./}"
-          prefix="${prefix%/}"
-          if [ "$prefix" = "." ] || [ -z "$prefix" ]; then prefix=""; fi
-
-          helm_json="$RUNNER_TEMP/helm-scan/helm.json"
-          hprefix=""
           if [ -n "$HELM_CHART" ]; then
-            hprefix="${HELM_CHART#./}"
-            hprefix="${hprefix%/}"
-            if [ ! -f "$GITHUB_WORKSPACE/$hprefix/Chart.yaml" ]; then
-              echo "::error::helm-chart '$HELM_CHART' does not contain a Chart.yaml"
-              exit 1
-            fi
-            rendered="$RUNNER_TEMP/helm-rendered"
-            mkdir -p "$rendered" "$RUNNER_TEMP/helm-scan"
-            if ! helm template "$GITHUB_WORKSPACE/$hprefix" --output-dir "$rendered" > /dev/null; then
-              echo "::error::helm template failed for '$HELM_CHART' (the chart must render with its default values and have its dependencies vendored)"
-              exit 1
-            fi
+            # Same ignore file as the main scan (the workspace is mounted for it).
             docker run --rm \
+              -v "$GITHUB_WORKSPACE:/repo:ro" \
               -v "$rendered:/helm:ro" \
               -v "$RUNNER_TEMP/helm-scan:/out" \
               "$TRIVY_IMAGE" \
               config \
               --exit-code 0 \
+              "${ignore[@]}" \
               --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
               --format json \
               --output /out/helm.json \
@@ -211,7 +228,7 @@ jobs:
             # the chart directory in the repository.
             jq --slurpfile h "$helm_json" --arg p "$prefix" --arg hc "$hprefix" '
               .Results = ([(.Results // [])[] | .Target |= (if $p == "" then . else $p + "/" + . end)]
-                + [($h[0].Results // [])[] | .Target |= ($hc + "/" + sub("^[^/]+/"; ""))])
+                + [($h[0].Results // [])[] | .Target |= ((if $hc == "" then "" else $hc + "/" end) + sub("^[^/]+/"; ""))])
             ' "$out/trivy.json" > "$norm"
           else
             jq --arg p "$prefix" '

@@ -15,29 +15,42 @@ name: image-scan
 # - SARIF: image findings have no source location, so every alert is attached
 #   to the Dockerfile (repository-relative path) to show up in code scanning.
 #
-# Build then scan then push: this workflow only builds and scans. The caller
-# pushes in a later job that has `needs:` on this one, so a failing scan in
-# `enforce` mode never leaves an unscanned image in the registry. Use the same
-# `image-name` here and in the caller's build so both share the build cache
-# (type=gha, scope=<image-name>) and the push job rebuilds from cache:
+# Build, scan, then push the SAME image: with `push: true` the image that was
+# built and scanned (`<image-name>:scan`, verified by image ID) is tagged with
+# each ref in `push-tags` and pushed to the registry, and only after the policy
+# step passed. In `enforce` mode a blocking finding fails the job before any push,
+# so an unscanned or rejected image never reaches the registry; in `report` mode
+# the image is pushed regardless of findings. Nothing is rebuilt, so the pushed
+# image cannot differ from the scanned one. The build cache (type=gha, scope
+# <image-name>) is only a speed optimisation and is best-effort; correctness does
+# not depend on it. Outputs `image-id` and `digest` (the pushed repo digest,
+# empty when nothing was pushed) can be passed to later jobs, for example to sign
+# and attach an SBOM to `<image>@<digest>`.
 #
 #   jobs:
 #     image-scan:
 #       permissions:
 #         contents: read
 #         security-events: write
+#         packages: write
 #       uses: <owner>/security-workflows/.github/workflows/image-scan.yml@main
 #       with:
 #         mode: enforce
 #         image-name: my-app
 #         context: .
+#         push: true
+#         push-tags: |
+#           ghcr.io/<owner>/my-app:latest
+#           ghcr.io/<owner>/my-app:sha-${{ github.sha }}
 #       secrets:
 #         build-args: |
 #           VITE_API_KEY=${{ secrets.VITE_API_KEY }}
-#     push:
+#     sign:
 #       needs: image-scan
-#       # docker/build-push-action with push: true, the same context and
-#       # cache-from: type=gha,scope=my-app
+#       # uses needs.image-scan.outputs.digest
+#
+# Pushing logs in to ghcr.io with the job token (`packages: write`). Registries
+# other than ghcr.io are not logged in to by this workflow.
 #
 # `build-args` (optional secret, multiline KEY=VALUE) carries build arguments
 # that are sensitive. It is masked in logs and never echoed by this workflow.
@@ -45,13 +58,15 @@ name: image-scan
 # must not ship in the image; use BuildKit secret mounts in the Dockerfile for
 # those. Fork pull requests do not receive secrets, so the build runs without it.
 #
-# Permissions: the job declares `security-events: write` (needed only for SARIF
-# upload). GitHub rejects a call whose caller grants less than the called
+# Permissions: the job declares `security-events: write` (SARIF upload) and
+# `packages: write` (push; used only when `push` is true). Both are needed
+# because GitHub rejects a call whose caller grants less than the called
 # workflow requests, so every caller job must grant:
 #
 #   permissions:
 #     contents: read
 #     security-events: write
+#     packages: write
 #
 # SARIF is skipped (with a warning) on fork PRs and Dependabot runs, and an
 # upload failure (e.g. no code scanning available) never fails the job.
@@ -91,6 +106,14 @@ on:
         description: "Local image name (lowercase). Tagged <image-name>:scan and used as the build cache scope, so the caller's push build should use the same value"
         type: string
         default: scan-image
+      push:
+        description: "Push the scanned image to the registry after the policy step passes (needs packages: write; ghcr.io only login). Requires push-tags"
+        type: boolean
+        default: false
+      push-tags:
+        description: "Newline-separated full image references to push, e.g. ghcr.io/owner/name:latest. Required when push is true"
+        type: string
+        default: ""
     secrets:
       build-args:
         description: "Optional multiline KEY=VALUE build arguments (for example VITE_API_KEY=...). Masked, never echoed"
@@ -102,6 +125,12 @@ on:
       total-count:
         description: "Total number of vulnerabilities (all severities)"
         value: ${{ jobs.image.outputs.total-count }}
+      image-id:
+        description: "ID (sha256:...) of the scanned image, which is the image that is pushed"
+        value: ${{ jobs.image.outputs.image-id }}
+      digest:
+        description: "Repo digest (sha256:...) of the pushed image; empty when push is false"
+        value: ${{ jobs.image.outputs.digest }}
 
 permissions:
   contents: read
@@ -112,9 +141,12 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      packages: write
     outputs:
       blocking-count: ${{ steps.parse.outputs.blocking-count }}
       total-count: ${{ steps.parse.outputs.total-count }}
+      image-id: ${{ steps.image-id.outputs.id }}
+      digest: ${{ steps.push.outputs.digest }}
     env:
       TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c # v0.76.1
       MODE: ${{ inputs.mode }}
@@ -123,6 +155,8 @@ jobs:
       CONTEXT: ${{ inputs.context }}
       DOCKERFILE: ${{ inputs.dockerfile }}
       IMAGE_NAME: ${{ inputs.image-name }}
+      PUSH: ${{ inputs.push }}
+      PUSH_TAGS: ${{ inputs.push-tags }}
     steps:
       - name: Validate inputs
         id: validate
@@ -145,8 +179,30 @@ jobs:
           case "$DOCKERFILE" in
             /*|*..*) echo "::error::dockerfile must be relative to the repository root and must not contain '..'"; exit 1 ;;
           esac
-          if ! printf '%s' "$IMAGE_NAME" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$'; then
-            echo "::error::image-name must be lowercase letters, digits, '.', '_', '-' or '/' and start with a letter or digit"
+          name_re='^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$'
+          if ! grep -Eq "$name_re" <<< "$IMAGE_NAME"; then
+            echo "::error::image-name must be lowercase path components of letters and digits separated by single '.', '_' or '-' (and '/' between components)"
+            exit 1
+          fi
+          case "$PUSH" in
+            true|false) ;;
+            *) echo "::error::Invalid push '$PUSH' (expected 'true' or 'false')"; exit 1 ;;
+          esac
+          ref_re='^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+          count=0
+          while IFS= read -r ref; do
+            ref="${ref%$'\r'}"
+            ref="${ref#"${ref%%[![:space:]]*}"}"
+            ref="${ref%"${ref##*[![:space:]]}"}"
+            [ -z "$ref" ] && continue
+            if ! grep -Eq "$ref_re" <<< "$ref"; then
+              echo "::error::push-tags entry is not a valid lowercase image reference with a tag (registry/repo:tag): '${ref//[^A-Za-z0-9._:\/-]/?}'"
+              exit 1
+            fi
+            count=$((count + 1))
+          done <<< "$PUSH_TAGS"
+          if [ "$PUSH" = "true" ] && [ "$count" -eq 0 ]; then
+            echo "::error::push-tags must list at least one image reference when push is true"
             exit 1
           fi
 
@@ -215,8 +271,22 @@ jobs:
           provenance: false
           tags: ${{ inputs.image-name }}:scan
           build-args: ${{ secrets.build-args }}
+          # Best-effort speed optimisation only: correctness (what is scanned and
+          # pushed) never depends on the cache.
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,scope=${{ inputs.image-name }},mode=max,ignore-error=true
+
+      - name: Record image ID
+        id: image-id
+        run: |
+          set -euo pipefail
+          id="$(docker inspect --format '{{.Id}}' "$IMAGE_NAME:scan")"
+          case "$id" in
+            sha256:*) ;;
+            *) echo "::error::Could not determine the ID of the built image"; exit 1 ;;
+          esac
+          echo "Scanned image ID: $id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
 
       - name: Run Trivy
         id: scan
@@ -394,3 +464,73 @@ jobs:
             exit 1
           fi
           echo "Mode '$MODE': $BLOCKING blocking finding(s)."
+
+      - name: Log in to ghcr.io
+        if: ${{ !cancelled() && inputs.push && steps.enforce.outcome == 'success' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push scanned image
+        id: push
+        if: ${{ !cancelled() && inputs.push && steps.enforce.outcome == 'success' }}
+        env:
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+          IMAGE_ID: ${{ steps.image-id.outputs.id }}
+        run: |
+          set -euo pipefail
+          # Defence in depth: never push when enforce mode has blocking findings,
+          # even if this step is reached.
+          if [ "$MODE" = "enforce" ] && [ "$BLOCKING" -gt 0 ]; then
+            echo "Blocking findings in enforce mode: not pushing."
+            echo "digest=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tags=()
+          while IFS= read -r ref; do
+            ref="${ref%$'\r'}"
+            ref="${ref#"${ref%%[![:space:]]*}"}"
+            ref="${ref%"${ref##*[![:space:]]}"}"
+            [ -z "$ref" ] && continue
+            tags+=("$ref")
+          done <<< "$PUSH_TAGS"
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "::error::push-tags is empty"
+            exit 1
+          fi
+
+          # Tag the exact image that was scanned and verify it before pushing.
+          current="$(docker inspect --format '{{.Id}}' "$IMAGE_NAME:scan")"
+          if [ "$current" != "$IMAGE_ID" ]; then
+            echo "::error::The local image changed after the scan ($current != $IMAGE_ID); refusing to push."
+            exit 1
+          fi
+          for ref in "${tags[@]}"; do
+            docker tag "$IMAGE_NAME:scan" "$ref"
+            tagged="$(docker inspect --format '{{.Id}}' "$ref")"
+            if [ "$tagged" != "$IMAGE_ID" ]; then
+              echo "::error::Tagged image ID differs from the scanned image ($tagged != $IMAGE_ID); refusing to push."
+              exit 1
+            fi
+          done
+
+          digest=""
+          log="$RUNNER_TEMP/push.log"
+          for ref in "${tags[@]}"; do
+            docker push "$ref" | tee "$log"
+            d="$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "$log" | sed -n '1p')"
+            if [ -z "$d" ]; then
+              echo "::error::Could not read the pushed digest for $ref"
+              exit 1
+            fi
+            if [ -n "$digest" ] && [ "$d" != "$digest" ]; then
+              echo "::error::Pushed digests differ between tags ($d != $digest)"
+              exit 1
+            fi
+            digest="$d"
+          done
+          echo "Pushed image $IMAGE_ID as $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"

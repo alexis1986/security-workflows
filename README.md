@@ -132,17 +132,22 @@ Scans Dockerfiles, Kubernetes manifests, Terraform and CloudFormation under
 version", so `blocking-count` is the number of CRITICAL or HIGH findings;
 `total-count` covers every severity. With `helm-chart`, the chart is rendered
 with `helm template` (default values; dependencies must be vendored) and the
-rendered manifests are scanned too, reported against the chart path. Exceptions
+rendered manifests are scanned too, reported against the chart path (the chart
+directory is excluded from the main scan, so findings are counted once; line
+numbers refer to the rendered manifest, not the template). Exceptions
 go in a `.trivyignore` (`ignore-path` works as in the SCA layer), each with a
 comment stating the reason and an expiry.
 
 ### Container image with Trivy
 
-`image-scan.yml` builds the image (no push) and scans it. Build, scan and push
-are separate jobs: the push job in your workflow declares `needs:` on the scan,
-so a failing scan in `enforce` mode never leaves an unscanned image in the
-registry. Use the same `image-name` in both so they share the build cache scope
-and the push job rebuilds from cache.
+`image-scan.yml` builds the image, scans it and, with `push: true`, pushes that
+same image. Nothing is rebuilt: the image that was scanned (checked by image ID)
+is tagged with each entry of `push-tags` and pushed, and only after the policy
+step passed. In `enforce` mode a blocking finding fails the job before any push;
+in `report` mode the image is pushed regardless of findings. The pushed image
+therefore cannot differ from the scanned one. Callers must grant
+`contents: read`, `security-events: write` and `packages: write` (the push logs
+in to `ghcr.io` with the job token; other registries are not supported).
 
 ```yaml
 jobs:
@@ -150,6 +155,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      packages: write
     uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
     with:
       mode: enforce
@@ -158,45 +164,36 @@ jobs:
       dockerfile: Dockerfile
       image-name: my-app
       artifact-name: image-report
+      push: true
+      push-tags: |
+        ghcr.io/<owner>/my-app:latest
+        ghcr.io/<owner>/my-app:sha-${{ github.sha }}
     secrets:
       build-args: |
         VITE_API_KEY=${{ secrets.VITE_API_KEY }}
 
-  push:
+  sign:
     needs: image-scan
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@<sha>
-      - uses: docker/setup-buildx-action@<sha>
-      - uses: docker/login-action@<sha>
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@<sha>
-        with:
-          context: .
-          push: true
-          tags: ghcr.io/<owner>/my-app:latest
-          build-args: |
-            VITE_API_KEY=${{ secrets.VITE_API_KEY }}
-          cache-from: type=gha,scope=my-app
+    # ... pass needs.image-scan.outputs.digest to sign-sbom
 ```
+
+Outputs besides the counts: `image-id` (ID of the scanned image) and `digest`
+(repo digest of the pushed image, empty when nothing was pushed). Pass
+`needs.image-scan.outputs.digest` to the signing and SBOM job. `push-tags`
+entries must be full lowercase references with a tag (`registry/repo:tag`).
 
 The image is built with `push: false` and `load: true`, exported to a tarball and
 scanned with `trivy image --input` (the Docker socket is never mounted into the
-scanner). `blocking-count` is the number of CRITICAL or HIGH vulnerabilities that
-have a fixed version available; `total-count` covers every severity. In the SARIF
-every alert is attached to the Dockerfile, since image findings have no source
-location. The optional secret `build-args` takes multiline `KEY=VALUE` build
-arguments; it is masked and never echoed. Build arguments end up in the image
-history, so keep truly confidential values out of them (use BuildKit secret
-mounts). Fork pull requests do not receive secrets, so their build runs without
-`build-args`. `context` defaults to `scan-path`; `dockerfile` defaults to
-`<context>/Dockerfile`.
+scanner). The build cache (`type=gha`, scope `image-name`) is a best-effort speed
+optimisation; correctness does not depend on it. `blocking-count` is the number
+of CRITICAL or HIGH vulnerabilities that have a fixed version available;
+`total-count` covers every severity. In the SARIF every alert is attached to the
+Dockerfile, since image findings have no source location. The optional secret
+`build-args` takes multiline `KEY=VALUE` build arguments; it is masked and never
+echoed. Build arguments end up in the image history, so keep truly confidential
+values out of them (use BuildKit secret mounts). Fork pull requests do not
+receive secrets, so their build runs without `build-args`. `context` defaults to
+`scan-path`; `dockerfile` defaults to `<context>/Dockerfile`.
 
 ## Maintenance
 

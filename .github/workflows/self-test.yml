@@ -224,6 +224,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      packages: write
     uses: ./.github/workflows/image-scan.yml
     with:
       mode: report
@@ -236,6 +237,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      packages: write
     uses: ./.github/workflows/image-scan.yml
     with:
       mode: report
@@ -389,9 +391,9 @@ jobs:
           extract sca.yml trivy sarif-paths
           sarif_sample='{"runs":[{"results":[{"locations":[{"physicalLocation":{"artifactLocation":{"uri":"pom.xml","uriBaseId":"ROOTPATH"}}}]}]}]}'
           i=0
-          for case in "backend:backend/pom.xml" "./backend/:backend/pom.xml" "a/b:a/b/pom.xml" ".:pom.xml"; do
+          for tc in "backend:backend/pom.xml" "./backend/:backend/pom.xml" "a/b:a/b/pom.xml" ".:pom.xml"; do
             i=$((i + 1))
-            sp="${case%%:*}"; exp_uri="${case#*:}"
+            sp="${tc%%:*}"; exp_uri="${tc#*:}"
             mkdir -p "$work/sp$i/trivy-out"
             echo "$sarif_sample" > "$work/sp$i/trivy-out/trivy.sarif"
             expect yes "trivy: sarif-paths runs for scan-path '$sp'" env RUNNER_TEMP="$work/sp$i" SCAN_PATH="$sp" bash "$work/trivy-sarif-paths.sh"
@@ -449,7 +451,52 @@ jobs:
           echo '{"runs":[{"results":[{"locations":[{"physicalLocation":{"artifactLocation":{"uri":"/tmp/x.yaml"}}}]}]}]}' > "$work/ip2/trivy-out/trivy.sarif"
           expect no "iac: sarif-paths refuses absolute locations" env RUNNER_TEMP="$work/ip2" bash "$work/trivy-sarif-paths.sh"
 
+          # Helm chart handling in the iac scan, with fake docker/helm binaries that
+          # record their arguments: the chart directory is skipped in the main scan
+          # (no double count) and the ignore file reaches both scans.
+          extract iac.yml trivy scan
+          fake="$work/fake-iac"; mkdir -p "$fake"
+          cat > "$fake/docker" <<'FAKE'
+          #!/usr/bin/env bash
+          echo "docker $*" >> "$FAKE_LOG"
+          if [ "$1" = run ]; then
+            args=("$@"); out=""; name=""
+            for i in "${!args[@]}"; do
+              if [ "${args[$i]}" = "-v" ]; then
+                v="${args[$((i + 1))]}"
+                case "$v" in *:/out) out="${v%:/out}" ;; esac
+              fi
+              if [ "${args[$i]}" = "--output" ]; then name="${args[$((i + 1))]##*/}"; fi
+            done
+            if [ -n "$out" ] && [ -n "$name" ]; then echo '{"SchemaVersion":2,"Results":[]}' > "$out/$name"; fi
+          fi
+          FAKE
+          cat > "$fake/helm" <<'FAKE'
+          #!/usr/bin/env bash
+          while [ $# -gt 0 ]; do
+            if [ "$1" = "--output-dir" ]; then mkdir -p "$2/x/templates"; fi
+            shift
+          done
+          FAKE
+          chmod +x "$fake/docker" "$fake/helm"
+          mkdir -p "$work/iw/deploy/chart" "$work/iw/deploy/app"
+          echo "name: x" > "$work/iw/deploy/chart/Chart.yaml"
+          : > "$work/iw/.trivyignore"
+          for variant in with-chart no-chart; do
+            rt="$work/ir-$variant"; mkdir -p "$rt"; : > "$work/ir-$variant.log"
+            chart=""; [ "$variant" = "with-chart" ] && chart="deploy/chart"
+            expect yes "iac: scan step runs ($variant)" \
+              env PATH="$fake:$PATH" FAKE_LOG="$work/ir-$variant.log" GITHUB_WORKSPACE="$work/iw" RUNNER_TEMP="$rt" \
+                TRIVY_IMAGE=trivy:test SCAN_PATH=deploy IGNORE_PATH= HELM_CHART="$chart" SARIF_ENABLED=false bash "$work/trivy-scan.sh"
+          done
+          skips="$(grep -c -e '--skip-dirs /repo/deploy/chart' "$work/ir-with-chart.log" || true)"
+          ignores="$(grep -c -e '--ignorefile /repo/.trivyignore' "$work/ir-with-chart.log" || true)"
+          if [ "$skips" = 1 ]; then echo "ok   - iac: chart directory skipped once in the main scan"; else echo "::error::FAIL - iac: expected one --skip-dirs, got $skips"; failures=$((failures + 1)); fi
+          if [ "$ignores" = 2 ]; then echo "ok   - iac: ignore file applied to the main and the helm scan"; else echo "::error::FAIL - iac: expected 2 --ignorefile, got $ignores"; failures=$((failures + 1)); fi
+          if grep -q -e '--skip-dirs' "$work/ir-no-chart.log"; then echo "::error::FAIL - iac: --skip-dirs used without helm-chart"; failures=$((failures + 1)); else echo "ok   - iac: no --skip-dirs without helm-chart"; fi
+
           # -------------------------------------------------------------- image
+          export PUSH=false PUSH_TAGS=
           # 3 vulns: HIGH with fix (blocking), CRITICAL without fix, LOW with fix.
           image_findings='{"SchemaVersion":2,"Results":[{"Target":"app (alpine 3.15)","Vulnerabilities":[
             {"VulnerabilityID":"CVE-1","Severity":"HIGH","FixedVersion":"1.0.1","PkgName":"a","InstalledVersion":"1.0.0"},
@@ -466,18 +513,71 @@ jobs:
             env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE=/etc/passwd IMAGE_NAME=my-app bash "$work/image-validate.sh"
           expect no  "image: validate rejects a dockerfile with '..'" \
             env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE=../Dockerfile IMAGE_NAME=my-app bash "$work/image-validate.sh"
-          for bad in "" "My-App" "app:tag" 'app;id' "-app" 'a b'; do
+          for bad in "" "My-App" "app:tag" 'app;id' "-app" 'a b' "app/" "a..b" "a//b" "/a" "a-"; do
             expect no  "image: validate rejects image-name '$bad'" \
               env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE= IMAGE_NAME="$bad" bash "$work/image-validate.sh"
           done
           expect yes "image: validate accepts a registry-style image-name" \
             env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT=backend DOCKERFILE=backend/Dockerfile IMAGE_NAME=org/my-app.v2 bash "$work/image-validate.sh"
 
+          # push / push-tags validation.
+          iv="$work/image-validate.sh"
+          base_env=(MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE= IMAGE_NAME=my-app)
+          expect yes "image: validate accepts push=false with no tags" env "${base_env[@]}" PUSH=false PUSH_TAGS= bash "$iv"
+          expect no  "image: validate rejects push=true without tags" env "${base_env[@]}" PUSH=true PUSH_TAGS= bash "$iv"
+          expect no  "image: validate rejects push=true with only blank tags" env "${base_env[@]}" PUSH=true PUSH_TAGS=$'\n  \n' bash "$iv"
+          expect no  "image: validate rejects an invalid push value" env "${base_env[@]}" PUSH=maybe PUSH_TAGS= bash "$iv"
+          expect yes "image: validate accepts several valid push-tags" \
+            env "${base_env[@]}" PUSH=true PUSH_TAGS=$'ghcr.io/owner/my-app:latest\nghcr.io/owner/my-app:sha-0123abc\n\nlocalhost:5000/team/app:1.2.3\n' bash "$iv"
+          for bad in "ghcr.io/Owner/app:latest" "ghcr.io/owner/app" "ghcr.io/owner/app:" "app:latest" 'ghcr.io/owner/app:t;id' 'ghcr.io/owner/app:a b' "ghcr.io//app:t" "ghcr.io/owner/app/:t" "ghcr.io/owner/../app:t" "https://ghcr.io/owner/app:t" "ghcr.io/owner/app@sha256:abc"; do
+            expect no "image: validate rejects push-tag '$bad'" \
+              env "${base_env[@]}" PUSH=true PUSH_TAGS=$'ghcr.io/owner/ok:latest\n'"$bad" bash "$iv"
+          done
+
+          # Push step with a fake docker: the scanned image is tagged and pushed only
+          # when the policy allows it, and only if its ID is unchanged.
+          extract image-scan.yml image push
+          fake="$work/fake-push"; mkdir -p "$fake"
+          cat > "$fake/docker" <<'FAKE'
+          #!/usr/bin/env bash
+          echo "docker $*" >> "$FAKE_LOG"
+          case "$1" in
+            inspect) echo "${FAKE_ID:-sha256:1111}" ;;
+            push) echo "latest: digest: sha256:$(printf 'b%.0s' $(seq 1 64)) size: 528" ;;
+          esac
+          FAKE
+          chmod +x "$fake/docker"
+          push_tags=$'ghcr.io/owner/my-app:latest\nghcr.io/owner/my-app:sha-abc'
+          # shellcheck disable=SC2329 # invoked through expect
+          run_push() { # <name> <mode> <blocking> <current-id>
+            mkdir -p "$work/p-$1"; : > "$work/p-$1.log"; : > "$work/p-$1.out"
+            env PATH="$fake:$PATH" FAKE_LOG="$work/p-$1.log" FAKE_ID="$4" RUNNER_TEMP="$work/p-$1" GITHUB_OUTPUT="$work/p-$1.out" \
+              MODE="$2" BLOCKING="$3" IMAGE_ID=sha256:1111 IMAGE_NAME=my-app PUSH_TAGS="$push_tags" bash "$work/image-push.sh"
+          }
+          expect yes "image: push step succeeds when nothing blocks" run_push ok enforce 0 sha256:1111
+          pushes="$(grep -c '^docker push ' "$work/p-ok.log" || true)"
+          tags_made="$(grep -c '^docker tag my-app:scan ghcr.io/owner/my-app:' "$work/p-ok.log" || true)"
+          if [ "$pushes" = 2 ] && [ "$tags_made" = 2 ]; then echo "ok   - image: every push-tag is tagged from the scanned image and pushed"; else echo "::error::FAIL - image: tags=$tags_made pushes=$pushes (expected 2/2)"; failures=$((failures + 1)); fi
+          expect_line "$work/p-ok.out" "digest=sha256:$(printf 'b%.0s' $(seq 1 64))" "image: push step outputs the pushed digest"
+          expect yes "image: push step skips (exit 0) when enforce has blocking findings" run_push blocked enforce 2 sha256:1111
+          if grep -q '^docker push ' "$work/p-blocked.log"; then echo "::error::FAIL - image: pushed despite blocking findings in enforce mode"; failures=$((failures + 1)); else echo "ok   - image: no push when enforce blocks"; fi
+          expect_line "$work/p-blocked.out" "digest=" "image: blocked run has an empty digest"
+          expect yes "image: push step still pushes in report mode with findings" run_push report report 2 sha256:1111
+          if grep -q '^docker push ' "$work/p-report.log"; then echo "ok   - image: report mode pushes regardless of findings"; else echo "::error::FAIL - image: report mode did not push"; failures=$((failures + 1)); fi
+          expect no  "image: push step refuses when the image ID changed" run_push changed enforce 0 sha256:2222
+          if grep -q '^docker push ' "$work/p-changed.log"; then echo "::error::FAIL - image: pushed an image whose ID changed"; failures=$((failures + 1)); else echo "ok   - image: no push when the ID changed"; fi
+          # The step is only reached after the policy step succeeded and when push is requested.
+          push_if="$(yq '.jobs.image.steps[] | select(.id == "push") | .if' .github/workflows/image-scan.yml)"
+          case "$push_if" in
+            *"steps.enforce.outcome == 'success'"*"inputs.push"*|*"inputs.push"*"steps.enforce.outcome == 'success'"*) echo "ok   - image: push step is gated on inputs.push and a successful enforce step" ;;
+            *) echo "::error::FAIL - image: push step is not gated on enforce success: $push_if"; failures=$((failures + 1)) ;;
+          esac
+
           # Build input resolution: context falls back to scan-path; the
           # Dockerfile defaults to <context>/Dockerfile.
           extract image-scan.yml image resolve
-          for case in "|.||.|Dockerfile" "|backend||backend|backend/Dockerfile" "|./backend/||backend|backend/Dockerfile" "svc|.||svc|svc/Dockerfile" "svc|.|./ops/Dockerfile|svc|ops/Dockerfile"; do
-            IFS='|' read -r c sp d ec ed <<< "$case"
+          for tc in "|.||.|Dockerfile" "|backend||backend|backend/Dockerfile" "|./backend/||backend|backend/Dockerfile" "svc|.||svc|svc/Dockerfile" "svc|.|./ops/Dockerfile|svc|ops/Dockerfile"; do
+            IFS='|' read -r c sp d ec ed <<< "$tc"
             : > "$work/res.out"
             env CONTEXT="$c" SCAN_PATH="$sp" DOCKERFILE="$d" GITHUB_OUTPUT="$work/res.out" bash "$work/image-resolve.sh"
             expect_line "$work/res.out" "context=$ec" "image: resolve (context '$c', scan-path '$sp') -> context=$ec"
