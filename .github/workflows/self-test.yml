@@ -17,9 +17,22 @@ name: self-test
 #      adjust the output references.
 #
 # Naming: call-<layer>-<case> calls the workflow, assert-<layer> checks outputs.
+#
+# Common interface rules every layer must follow (so calls never collide):
+#   - `artifact-name` input (default `<layer>-report`): each call in this file
+#     passes a distinct name (`<layer>-report-vulnerable`, `<layer>-report-clean`),
+#     because upload-artifact rejects duplicate names within one run.
+#   - Fixture scans must not pick up this repository's own scanner config:
+#     pass the layer's config opt-out (secrets: `config-path: none`).
+#   - Every caller job grants `contents: read` and `security-events: write`.
+#
+# The `test-scripts` job covers what the fixtures cannot: failure paths of the
+# parse/enforce scripts (missing report, invalid report, enforce vs report).
+# Add equivalent assertions when a new layer introduces its own scripts.
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -38,6 +51,8 @@ jobs:
     with:
       mode: report
       scan-path: fixtures/vulnerable/secrets
+      artifact-name: secrets-report-vulnerable
+      config-path: none
 
   call-secrets-clean:
     permissions:
@@ -47,6 +62,8 @@ jobs:
     with:
       mode: report
       scan-path: fixtures/clean/secrets
+      artifact-name: secrets-report-clean
+      config-path: none
 
   assert-secrets:
     needs: [call-secrets-vulnerable, call-secrets-clean]
@@ -68,3 +85,47 @@ jobs:
             *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Gitleaks reported findings in the clean fixture"; fail=1; } ;;
           esac
           exit "$fail"
+
+  # Failure-path tests for the scripts embedded in secrets.yml. The scripts are
+  # extracted by step id and run with simulated inputs.
+  test-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test parse and enforce scripts
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/secrets.yml
+          work="$(mktemp -d)"
+          extract() { yq ".jobs.gitleaks.steps[] | select(.id == \"$1\") | .run" "$wf" > "$work/$1.sh"; [ -s "$work/$1.sh" ] || { echo "::error::step '$1' not found in $wf"; exit 1; }; }
+          extract parse
+          extract enforce
+
+          failures=0
+          expect() { # expected-exit-is-zero(yes|no) description command...
+            want="$1"; desc="$2"; shift 2
+            if "$@" > "$work/out.log" 2>&1; then got=yes; else got=no; fi
+            if [ "$got" = "$want" ]; then echo "ok   - $desc"; else echo "::error::FAIL - $desc (exit-zero expected: $want)"; cat "$work/out.log"; failures=$((failures + 1)); fi
+          }
+
+          # (a) report missing -> parse must fail
+          mkdir -p "$work/a"
+          expect no "parse fails when the report is missing"             env RUNNER_TEMP="$work/a" GITHUB_OUTPUT="$work/a.out" bash "$work/parse.sh"
+
+          # (b) report is not a JSON array -> parse must fail
+          mkdir -p "$work/b/gitleaks-out"; echo '{"error": true}' > "$work/b/gitleaks-out/gitleaks.json"
+          expect no "parse fails when the report is not a JSON array"             env RUNNER_TEMP="$work/b" GITHUB_OUTPUT="$work/b.out" bash "$work/parse.sh"
+
+          # sanity: a valid empty report parses to zero findings
+          mkdir -p "$work/ok/gitleaks-out"; echo '[]' > "$work/ok/gitleaks-out/gitleaks.json"
+          expect yes "parse succeeds on a valid empty report"             env RUNNER_TEMP="$work/ok" GITHUB_OUTPUT="$work/ok.out" bash "$work/parse.sh"
+          grep -qx 'blocking-count=0' "$work/ok.out" || { echo "::error::expected blocking-count=0"; failures=$((failures + 1)); }
+
+          # (c) enforce with findings -> must fail; (d) report with findings -> must pass
+          expect no  "enforce fails in enforce mode with blocking findings" env MODE=enforce BLOCKING=2 bash "$work/enforce.sh"
+          expect yes "enforce passes in report mode with blocking findings" env MODE=report BLOCKING=2 bash "$work/enforce.sh"
+          expect yes "enforce passes in enforce mode without findings" env MODE=enforce BLOCKING=0 bash "$work/enforce.sh"
+
+          exit "$failures"
