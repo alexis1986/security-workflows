@@ -3,18 +3,19 @@ name: self-test
 # Self-test for the reusable workflows in this repository.
 #
 # Every reusable workflow exposes the same interface (inputs: mode, scan-path,
-# upload-sarif; outputs: blocking-count, total-count). Each layer is exercised
-# against two fixture sets, always with `mode: report` so a finding never fails
-# the call itself:
+# upload-sarif, artifact-name; outputs: blocking-count, total-count). Each layer
+# is exercised against two fixture sets, always with `mode: report` so a finding
+# never fails the call itself:
 #
 #   fixtures/vulnerable/<layer>  -> must produce blocking-count >= 1
 #   fixtures/clean/<layer>       -> must produce blocking-count == 0
 #
-# To add a layer (for example `sca`):
-#   1. Add fixtures under fixtures/vulnerable/sca and fixtures/clean/sca.
+# To add a layer (for example `iac`):
+#   1. Add fixtures under fixtures/vulnerable/iac and fixtures/clean/iac.
 #   2. Copy the two `call-<layer>-*` jobs below and change `uses:` and `scan-path`.
 #   3. Copy the `assert-<layer>` job, point `needs:` at the new call jobs and
 #      adjust the output references.
+#   4. Add a `check_layer` call (and `check_validate`) to the `test-scripts` job.
 #
 # Naming: call-<layer>-<case> calls the workflow, assert-<layer> checks outputs.
 #
@@ -23,12 +24,14 @@ name: self-test
 #     passes a distinct name (`<layer>-report-vulnerable`, `<layer>-report-clean`),
 #     because upload-artifact rejects duplicate names within one run.
 #   - Fixture scans must not pick up this repository's own scanner config:
-#     pass the layer's config opt-out (secrets: `config-path: none`).
+#     pass the layer's config opt-out (secrets: `config-path: none`,
+#     sca: `ignore-path: none`).
 #   - Every caller job grants `contents: read` and `security-events: write`.
 #
 # The `test-scripts` job covers what the fixtures cannot: failure paths of the
-# parse/enforce scripts (missing report, invalid report, enforce vs report).
-# Add equivalent assertions when a new layer introduces its own scripts.
+# validate/parse/enforce scripts (invalid paths, missing report, invalid report,
+# enforce vs report). Add equivalent assertions when a new layer introduces its
+# own scripts.
 
 on:
   push:
@@ -86,46 +89,225 @@ jobs:
           esac
           exit "$fail"
 
-  # Failure-path tests for the scripts embedded in secrets.yml. The scripts are
-  # extracted by step id and run with simulated inputs.
+  # -------------------------------------------------------------------- sca
+  call-sca-vulnerable:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/sca.yml
+    with:
+      mode: report
+      scan-path: fixtures/vulnerable/sca
+      artifact-name: sca-report-vulnerable
+      ignore-path: none
+
+  call-sca-clean:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/sca.yml
+    with:
+      mode: report
+      scan-path: fixtures/clean/sca
+      artifact-name: sca-report-clean
+      ignore-path: none
+
+  assert-sca:
+    needs: [call-sca-vulnerable, call-sca-clean]
+    runs-on: ubuntu-latest
+    env:
+      VULNERABLE_BLOCKING: ${{ needs.call-sca-vulnerable.outputs.blocking-count }}
+      CLEAN_BLOCKING: ${{ needs.call-sca-clean.outputs.blocking-count }}
+    steps:
+      - name: Assert expected counts
+        run: |
+          set -euo pipefail
+          fail=0
+          echo "vulnerable blocking-count: '$VULNERABLE_BLOCKING' (expected >= 1)"
+          echo "clean blocking-count:      '$CLEAN_BLOCKING' (expected 0)"
+          case "$VULNERABLE_BLOCKING" in ''|*[!0-9]*) echo "::error::vulnerable blocking-count is not numeric"; fail=1 ;;
+            *) [ "$VULNERABLE_BLOCKING" -ge 1 ] || { echo "::error::Trivy found nothing in the vulnerable fixture (false green)"; fail=1; } ;;
+          esac
+          case "$CLEAN_BLOCKING" in ''|*[!0-9]*) echo "::error::clean blocking-count is not numeric"; fail=1 ;;
+            *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Trivy reported findings in the clean fixture"; fail=1; } ;;
+          esac
+          exit "$fail"
+
+  # ------------------------------------------------------------------- sast
+  call-sast-vulnerable:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/sast.yml
+    with:
+      mode: report
+      scan-path: fixtures/vulnerable/sast
+      artifact-name: sast-report-vulnerable
+
+  call-sast-clean:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/sast.yml
+    with:
+      mode: report
+      scan-path: fixtures/clean/sast
+      artifact-name: sast-report-clean
+
+  assert-sast:
+    needs: [call-sast-vulnerable, call-sast-clean]
+    runs-on: ubuntu-latest
+    env:
+      VULNERABLE_BLOCKING: ${{ needs.call-sast-vulnerable.outputs.blocking-count }}
+      CLEAN_BLOCKING: ${{ needs.call-sast-clean.outputs.blocking-count }}
+    steps:
+      - name: Assert expected counts
+        run: |
+          set -euo pipefail
+          fail=0
+          echo "vulnerable blocking-count: '$VULNERABLE_BLOCKING' (expected >= 1)"
+          echo "clean blocking-count:      '$CLEAN_BLOCKING' (expected 0)"
+          case "$VULNERABLE_BLOCKING" in ''|*[!0-9]*) echo "::error::vulnerable blocking-count is not numeric"; fail=1 ;;
+            *) [ "$VULNERABLE_BLOCKING" -ge 1 ] || { echo "::error::Semgrep found nothing in the vulnerable fixture (false green)"; fail=1; } ;;
+          esac
+          case "$CLEAN_BLOCKING" in ''|*[!0-9]*) echo "::error::clean blocking-count is not numeric"; fail=1 ;;
+            *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Semgrep reported findings in the clean fixture"; fail=1; } ;;
+          esac
+          exit "$fail"
+
+  # Failure-path tests for the scripts embedded in each reusable workflow. The
+  # scripts are extracted by step id and run with simulated inputs.
   test-scripts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Test parse and enforce scripts
+      - name: Test validate, parse and enforce scripts
         run: |
           set -euo pipefail
-          wf=.github/workflows/secrets.yml
           work="$(mktemp -d)"
-          extract() { yq ".jobs.gitleaks.steps[] | select(.id == \"$1\") | .run" "$wf" > "$work/$1.sh"; [ -s "$work/$1.sh" ] || { echo "::error::step '$1' not found in $wf"; exit 1; }; }
-          extract parse
-          extract enforce
-
           failures=0
-          expect() { # expected-exit-is-zero(yes|no) description command...
+
+          # extract <workflow-file> <job-id> <step-id> -> $work/<job-id>-<step-id>.sh
+          extract() {
+            local out="$work/$2-$3.sh"
+            yq ".jobs.$2.steps[] | select(.id == \"$3\") | .run" ".github/workflows/$1" > "$out"
+            [ -s "$out" ] || { echo "::error::step '$3' not found in $1"; exit 1; }
+          }
+          # expect <yes|no: should the command exit 0> <description> <command...>
+          expect() {
             want="$1"; desc="$2"; shift 2
             if "$@" > "$work/out.log" 2>&1; then got=yes; else got=no; fi
-            if [ "$got" = "$want" ]; then echo "ok   - $desc"; else echo "::error::FAIL - $desc (exit-zero expected: $want)"; cat "$work/out.log"; failures=$((failures + 1)); fi
+            if [ "$got" = "$want" ]; then
+              echo "ok   - $desc"
+            else
+              echo "::error::FAIL - $desc (exit-zero expected: $want)"; cat "$work/out.log"
+              failures=$((failures + 1))
+            fi
+          }
+          # expect_line <file> <line> <description>
+          expect_line() {
+            if grep -qx "$2" "$1"; then
+              echo "ok   - $3"
+            else
+              echo "::error::FAIL - $3 (expected '$2' in $1)"; cat "$1" 2>/dev/null || true
+              failures=$((failures + 1))
+            fi
           }
 
-          # (a) report missing -> parse must fail
-          mkdir -p "$work/a"
-          expect no "parse fails when the report is missing"             env RUNNER_TEMP="$work/a" GITHUB_OUTPUT="$work/a.out" bash "$work/parse.sh"
+          # check_layer <workflow-file> <job-id> <report-dir> <report-file> <invalid-json>
+          #             <valid-empty-json> <findings-json> <expected-blocking> <expected-total>
+          check_layer() {
+            local wf="$1" job="$2" dir="$3" file="$4" invalid="$5" empty="$6" findings="$7" eb="$8" et="$9"
+            local base="$work/$job"
+            extract "$wf" "$job" parse
+            extract "$wf" "$job" enforce
+            local parse="$work/$job-parse.sh" enforce="$work/$job-enforce.sh"
 
-          # (b) report is not a JSON array -> parse must fail
-          mkdir -p "$work/b/gitleaks-out"; echo '{"error": true}' > "$work/b/gitleaks-out/gitleaks.json"
-          expect no "parse fails when the report is not a JSON array"             env RUNNER_TEMP="$work/b" GITHUB_OUTPUT="$work/b.out" bash "$work/parse.sh"
+            # (a) report missing -> parse must fail (no false green)
+            mkdir -p "$base/a"
+            expect no "$job: parse fails when the report is missing" \
+              env RUNNER_TEMP="$base/a" GITHUB_OUTPUT="$base/a.out" bash "$parse"
 
-          # sanity: a valid empty report parses to zero findings
-          mkdir -p "$work/ok/gitleaks-out"; echo '[]' > "$work/ok/gitleaks-out/gitleaks.json"
-          expect yes "parse succeeds on a valid empty report"             env RUNNER_TEMP="$work/ok" GITHUB_OUTPUT="$work/ok.out" bash "$work/parse.sh"
-          grep -qx 'blocking-count=0' "$work/ok.out" || { echo "::error::expected blocking-count=0"; failures=$((failures + 1)); }
+            # (b) report is not valid for the tool -> parse must fail
+            mkdir -p "$base/b/$dir"; echo "$invalid" > "$base/b/$dir/$file"
+            expect no "$job: parse fails when the report is invalid" \
+              env RUNNER_TEMP="$base/b" GITHUB_OUTPUT="$base/b.out" bash "$parse"
 
-          # (c) enforce with findings -> must fail; (d) report with findings -> must pass
-          expect no  "enforce fails in enforce mode with blocking findings" env MODE=enforce BLOCKING=2 bash "$work/enforce.sh"
-          expect yes "enforce passes in report mode with blocking findings" env MODE=report BLOCKING=2 bash "$work/enforce.sh"
-          expect yes "enforce passes in enforce mode without findings" env MODE=enforce BLOCKING=0 bash "$work/enforce.sh"
+            # sanity: a valid empty report parses to zero findings
+            mkdir -p "$base/ok/$dir"; echo "$empty" > "$base/ok/$dir/$file"
+            expect yes "$job: parse succeeds on a valid empty report" \
+              env RUNNER_TEMP="$base/ok" GITHUB_OUTPUT="$base/ok.out" bash "$parse"
+            expect_line "$base/ok.out" "blocking-count=0" "$job: empty report -> blocking-count=0"
+
+            # report with findings: counts follow the blocking policy
+            mkdir -p "$base/f/$dir"; echo "$findings" > "$base/f/$dir/$file"
+            expect yes "$job: parse succeeds on a report with findings" \
+              env RUNNER_TEMP="$base/f" GITHUB_OUTPUT="$base/f.out" bash "$parse"
+            expect_line "$base/f.out" "blocking-count=$eb" "$job: findings report -> blocking-count=$eb"
+            expect_line "$base/f.out" "total-count=$et" "$job: findings report -> total-count=$et"
+
+            # (c) enforce with findings -> must fail; (d) report mode / no findings -> must pass
+            expect no  "$job: enforce fails in enforce mode with blocking findings" \
+              env MODE=enforce BLOCKING=2 bash "$enforce"
+            expect yes "$job: enforce passes in report mode with blocking findings" \
+              env MODE=report BLOCKING=2 bash "$enforce"
+            expect yes "$job: enforce passes in enforce mode without findings" \
+              env MODE=enforce BLOCKING=0 bash "$enforce"
+          }
+
+          # check_validate <workflow-file> <job-id> <extra-env...>: mode and scan-path validation
+          check_validate() {
+            local wf="$1" job="$2"; shift 2
+            extract "$wf" "$job" validate
+            local script="$work/$job-validate.sh"
+            expect yes "$job: validate accepts the defaults" env MODE=report SCAN_PATH=. "$@" bash "$script"
+            expect no  "$job: validate rejects an invalid mode" env MODE=bogus SCAN_PATH=. "$@" bash "$script"
+            expect no  "$job: validate rejects an absolute scan-path" env MODE=report SCAN_PATH=/etc "$@" bash "$script"
+            expect no  "$job: validate rejects a scan-path with '..'" env MODE=report SCAN_PATH=../x "$@" bash "$script"
+            expect no  "$job: validate rejects an empty scan-path" env MODE=report SCAN_PATH= "$@" bash "$script"
+          }
+
+          # ------------------------------------------------------------ secrets
+          check_layer secrets.yml gitleaks gitleaks-out gitleaks.json \
+            '{"error": true}' '[]' '[{"RuleID":"a"},{"RuleID":"b"}]' 2 2
+          check_validate secrets.yml gitleaks CONFIG_PATH=
+          expect no  "gitleaks: validate rejects an absolute config-path" \
+            env MODE=report SCAN_PATH=. CONFIG_PATH=/etc/x.toml bash "$work/gitleaks-validate.sh"
+          expect no  "gitleaks: validate rejects a config-path with '..'" \
+            env MODE=report SCAN_PATH=. CONFIG_PATH=../x.toml bash "$work/gitleaks-validate.sh"
+          expect yes "gitleaks: validate accepts config-path 'none'" \
+            env MODE=report SCAN_PATH=. CONFIG_PATH=none bash "$work/gitleaks-validate.sh"
+
+          # ---------------------------------------------------------------- sca
+          # 3 vulns: HIGH with fix (blocking), HIGH without fix, LOW with fix.
+          sca_findings='{"SchemaVersion":2,"Results":[{"Target":"pnpm-lock.yaml","Vulnerabilities":[
+            {"VulnerabilityID":"CVE-1","Severity":"HIGH","FixedVersion":"1.0.1","PkgName":"a","InstalledVersion":"1.0.0"},
+            {"VulnerabilityID":"CVE-2","Severity":"HIGH","PkgName":"b","InstalledVersion":"1.0.0"},
+            {"VulnerabilityID":"CVE-3","Severity":"LOW","FixedVersion":"2.0.0","PkgName":"c","InstalledVersion":"1.0.0"}]}]}'
+          check_layer sca.yml trivy trivy-out trivy.json \
+            '{"error": true}' '{"SchemaVersion":2}' "$sca_findings" 1 3
+          check_validate sca.yml trivy IGNORE_PATH=
+          expect no  "trivy: validate rejects an absolute ignore-path" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH=/etc/x bash "$work/trivy-validate.sh"
+          expect no  "trivy: validate rejects an ignore-path with '..'" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH=../x bash "$work/trivy-validate.sh"
+
+          # --------------------------------------------------------------- sast
+          # 3 results: two ERROR (blocking), one WARNING.
+          sast_findings='{"results":[
+            {"check_id":"r1","path":"a.ts","start":{"line":1},"extra":{"severity":"ERROR","message":"m"}},
+            {"check_id":"r2","path":"b.java","start":{"line":2},"extra":{"severity":"ERROR","message":"m"}},
+            {"check_id":"r3","path":"c.ts","start":{"line":3},"extra":{"severity":"WARNING","message":"m"}}],"errors":[]}'
+          check_layer sast.yml semgrep semgrep-out semgrep.json \
+            '{"error": true}' '{"results":[],"errors":[]}' "$sast_findings" 2 3
+          check_validate sast.yml semgrep RULESETS="p/typescript p/java"
+          expect no  "semgrep: validate rejects empty rulesets" \
+            env MODE=report SCAN_PATH=. RULESETS= bash "$work/semgrep-validate.sh"
+          expect no  "semgrep: validate rejects rulesets with shell metacharacters" \
+            env MODE=report SCAN_PATH=. RULESETS='p/java;id' bash "$work/semgrep-validate.sh"
+          expect no  "semgrep: validate rejects a rulesets path with '..'" \
+            env MODE=report SCAN_PATH=. RULESETS='../rules' bash "$work/semgrep-validate.sh"
 
           exit "$failures"

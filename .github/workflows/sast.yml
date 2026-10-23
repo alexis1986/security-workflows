@@ -1,0 +1,258 @@
+name: sast
+
+# Reusable workflow: static analysis (SAST) with Semgrep Community Edition.
+#
+# - Rules come from the `rulesets` input (Semgrep registry packs or paths to
+#   rule files in the repository, separated by spaces).
+# - total-count    : findings of every severity.
+# - blocking-count : findings with severity ERROR.
+# - Ignore file: the consumer's '.semgrepignore' at the repository root is
+#   honoured. Give every entry a comment with the reason and an expiry.
+# - Metrics are disabled; only the rule packs are fetched from the registry.
+#
+# Permissions: the job declares `security-events: write` (needed only for SARIF
+# upload). GitHub rejects a call whose caller grants less than the called
+# workflow requests, so every caller job must grant:
+#
+#   permissions:
+#     contents: read
+#     security-events: write
+#
+# SARIF is skipped (with a warning) on fork PRs and Dependabot runs, and an
+# upload failure (e.g. no code scanning available) never fails the job.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "report (never fails on findings) or enforce (fails on blocking findings)"
+        type: string
+        default: report
+      scan-path:
+        description: "Path to scan, relative to the repository root"
+        type: string
+        default: "."
+      upload-sarif:
+        description: "Upload a SARIF report to GitHub code scanning (needs security-events: write)"
+        type: boolean
+        default: false
+      artifact-name:
+        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once"
+        type: string
+        default: sast-report
+      rulesets:
+        description: "Space-separated Semgrep rule sources: registry packs (p/java) or rule files relative to the repository root"
+        type: string
+        default: "p/typescript p/java p/owasp-top-ten"
+    outputs:
+      blocking-count:
+        description: "Number of findings with severity ERROR"
+        value: ${{ jobs.semgrep.outputs.blocking-count }}
+      total-count:
+        description: "Total number of findings (all severities)"
+        value: ${{ jobs.semgrep.outputs.total-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      blocking-count: ${{ steps.parse.outputs.blocking-count }}
+      total-count: ${{ steps.parse.outputs.total-count }}
+    env:
+      SEMGREP_IMAGE: semgrep/semgrep:1.182.0@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af # v1.182.0
+      MODE: ${{ inputs.mode }}
+      SCAN_PATH: ${{ inputs.scan-path }}
+      RULESETS: ${{ inputs.rulesets }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            report|enforce) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected 'report' or 'enforce')"; exit 1 ;;
+          esac
+          case "$SCAN_PATH" in
+            /*|*..*) echo "::error::scan-path must be relative to the repository root and must not contain '..'"; exit 1 ;;
+            "") echo "::error::scan-path must not be empty"; exit 1 ;;
+          esac
+          read -ra sources <<< "$RULESETS"
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "::error::rulesets must not be empty"
+            exit 1
+          fi
+          for source in "${sources[@]}"; do
+            case "$source" in
+              /*|*..*|-*) echo "::error::Invalid ruleset '$source': must be relative and must not contain '..'"; exit 1 ;;
+            esac
+            if ! [[ "$source" =~ ^[A-Za-z0-9_./:@-]+$ ]]; then
+              echo "::error::Invalid ruleset '$source': only letters, digits and _ . / : @ - are allowed"
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide SARIF
+        id: sarif
+        env:
+          WANT_SARIF: ${{ inputs.upload-sarif }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          enabled=false
+          if [ "$WANT_SARIF" = "true" ]; then
+            if [ "$IS_FORK_PR" = "true" ] || [ "$ACTOR" = "dependabot[bot]" ]; then
+              echo "::warning::SARIF upload skipped: fork and Dependabot runs have a read-only token."
+            else
+              enabled=true
+            fi
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+      - name: Run Semgrep
+        id: scan
+        env:
+          SARIF_ENABLED: ${{ steps.sarif.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/semgrep-out"
+          mkdir -p "$out"
+
+          if [ ! -e "$GITHUB_WORKSPACE/$SCAN_PATH" ]; then
+            echo "::error::scan-path '$SCAN_PATH' does not exist in the repository"
+            exit 1
+          fi
+
+          config=()
+          read -ra sources <<< "$RULESETS"
+          for source in "${sources[@]}"; do
+            config+=(--config "$source")
+          done
+
+          output=(--json-output /out/semgrep.json)
+          if [ "$SARIF_ENABLED" = "true" ]; then
+            output+=(--sarif-output /out/semgrep.sarif)
+          fi
+
+          # The workspace root is the working directory, so '.semgrepignore' at the
+          # repository root is honoured. Findings do not change the exit code.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$out:/out" \
+            -w /src \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/src \
+            "$SEMGREP_IMAGE" \
+            semgrep scan \
+            "${config[@]}" \
+            --metrics=off \
+            --disable-version-check \
+            "${output[@]}" \
+            "./$SCAN_PATH"
+
+      - name: Parse report
+        id: parse
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/semgrep-out/semgrep.json"
+
+          # Never report zero findings when the scan produced no report.
+          if [ ! -f "$report" ]; then
+            echo "::error::Semgrep report not found at $report. The scan did not run or failed to write its output; refusing to report 0 findings."
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and (.results | type == "array")' "$report" > /dev/null; then
+            echo "::error::Semgrep report is not a valid Semgrep JSON document; refusing to report 0 findings."
+            exit 1
+          fi
+
+          total="$(jq '.results | length' "$report")"
+          # Blocking: severity ERROR.
+          blocking="$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' "$report")"
+          echo "total-count=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking-count=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        id: summary
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          TOTAL: ${{ steps.parse.outputs.total-count }}
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/semgrep-out/semgrep.json"
+          {
+            echo "## SAST (Semgrep)"
+            echo
+            echo "Scan: \`$SCAN_PATH\` | Mode: \`$MODE\` | Rules: \`$RULESETS\`"
+            echo
+            echo "| Tool | Severity | Count |"
+            echo "|---|---|---|"
+            jq -r '.results as $r
+              | ("ERROR","WARNING","INFO") as $s
+              | "| Semgrep | \($s) | \([$r[] | select(.extra.severity == $s)] | length) |"' "$report"
+            echo "| Semgrep | **Blocking** (ERROR) | $BLOCKING |"
+            if [ "$TOTAL" -gt 0 ]; then
+              echo
+              echo "### Top 10 findings"
+              echo
+              echo "| Rule | Severity | Location |"
+              echo "|---|---|---|"
+              jq -r 'def esc: gsub("(?<c>[|`])"; "\\" + .c);
+                def rank: {"ERROR": 0, "WARNING": 1}[.] // 2;
+                .results
+                | sort_by(.extra.severity | rank)
+                | .[:10][]
+                | "| \(.check_id | esc) | \((.extra.severity // "-") | esc) | \(.path | esc):\(.start.line) |"' "$report"
+              if [ "$TOTAL" -gt 10 ]; then
+                echo
+                echo "_$((TOTAL - 10)) more in the \`$ARTIFACT_NAME\` artifact._"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/semgrep-out/
+          if-no-files-found: error
+
+      - name: Upload SARIF to code scanning
+        id: upload-sarif
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' && steps.sarif.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/semgrep-out/semgrep.sarif
+          category: sast
+
+      - name: Warn if SARIF upload failed
+        if: ${{ steps.upload-sarif.outcome == 'failure' }}
+        run: echo "::warning::SARIF upload failed (code scanning may be unavailable for this repository or token). The scan result is not affected."
+
+      - name: Enforce policy
+        id: enforce
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "enforce" ] && [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::$BLOCKING blocking finding(s): Semgrep findings with severity ERROR. See the job summary and the report artifact."
+            exit 1
+          fi
+          echo "Mode '$MODE': $BLOCKING blocking finding(s)."

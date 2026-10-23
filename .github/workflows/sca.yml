@@ -1,0 +1,259 @@
+name: sca
+
+# Reusable workflow: dependency (SCA) scanning with Trivy `fs`.
+#
+# - Scans the lockfiles/manifests under `scan-path` (pnpm, npm, Maven, ...).
+# - total-count    : vulnerabilities of every severity.
+# - blocking-count : CRITICAL or HIGH vulnerabilities that have a fixed version
+#                    available (same policy as `trivy --ignore-unfixed`).
+# - Ignore file: by default the consumer's '.trivyignore' inside `scan-path` is
+#   used when it exists, otherwise the one at the repository root (see
+#   `ignore-path`). Give every entry a comment with the reason and an expiry.
+#
+# Permissions: the job declares `security-events: write` (needed only for SARIF
+# upload). GitHub rejects a call whose caller grants less than the called
+# workflow requests, so every caller job must grant:
+#
+#   permissions:
+#     contents: read
+#     security-events: write
+#
+# SARIF is skipped (with a warning) on fork PRs and Dependabot runs, and an
+# upload failure (e.g. no code scanning available) never fails the job.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "report (never fails on findings) or enforce (fails on blocking findings)"
+        type: string
+        default: report
+      scan-path:
+        description: "Path to scan, relative to the repository root"
+        type: string
+        default: "."
+      upload-sarif:
+        description: "Upload a SARIF report to GitHub code scanning (needs security-events: write)"
+        type: boolean
+        default: false
+      artifact-name:
+        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once"
+        type: string
+        default: sca-report
+      ignore-path:
+        description: "Trivy ignore file relative to the repository root. Empty: use .trivyignore in scan-path, else at the root, if present. 'none': ignore any .trivyignore"
+        type: string
+        default: ""
+    outputs:
+      blocking-count:
+        description: "Number of CRITICAL/HIGH vulnerabilities with a fix available"
+        value: ${{ jobs.trivy.outputs.blocking-count }}
+      total-count:
+        description: "Total number of vulnerabilities (all severities)"
+        value: ${{ jobs.trivy.outputs.total-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  trivy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      blocking-count: ${{ steps.parse.outputs.blocking-count }}
+      total-count: ${{ steps.parse.outputs.total-count }}
+    env:
+      TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c # v0.76.1
+      MODE: ${{ inputs.mode }}
+      SCAN_PATH: ${{ inputs.scan-path }}
+      IGNORE_PATH: ${{ inputs.ignore-path }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            report|enforce) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected 'report' or 'enforce')"; exit 1 ;;
+          esac
+          case "$SCAN_PATH" in
+            /*|*..*) echo "::error::scan-path must be relative to the repository root and must not contain '..'"; exit 1 ;;
+            "") echo "::error::scan-path must not be empty"; exit 1 ;;
+          esac
+          case "$IGNORE_PATH" in
+            /*|*..*) echo "::error::ignore-path must be relative to the repository root and must not contain '..'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide SARIF
+        id: sarif
+        env:
+          WANT_SARIF: ${{ inputs.upload-sarif }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          enabled=false
+          if [ "$WANT_SARIF" = "true" ]; then
+            if [ "$IS_FORK_PR" = "true" ] || [ "$ACTOR" = "dependabot[bot]" ]; then
+              echo "::warning::SARIF upload skipped: fork and Dependabot runs have a read-only token."
+            else
+              enabled=true
+            fi
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+      - name: Run Trivy
+        id: scan
+        env:
+          SARIF_ENABLED: ${{ steps.sarif.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/trivy-out"
+          mkdir -p "$out"
+
+          if [ ! -e "$GITHUB_WORKSPACE/$SCAN_PATH" ]; then
+            echo "::error::scan-path '$SCAN_PATH' does not exist in the repository"
+            exit 1
+          fi
+
+          ignore=()
+          case "$IGNORE_PATH" in
+            none) ;;
+            "")
+              if [ -f "$GITHUB_WORKSPACE/$SCAN_PATH/.trivyignore" ]; then
+                ignore=(--ignorefile "/repo/$SCAN_PATH/.trivyignore")
+              elif [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
+                ignore=(--ignorefile /repo/.trivyignore)
+              fi ;;
+            *)
+              if [ ! -f "$GITHUB_WORKSPACE/$IGNORE_PATH" ]; then
+                echo "::error::ignore-path '$IGNORE_PATH' does not exist in the repository"
+                exit 1
+              fi
+              ignore=(--ignorefile "/repo/$IGNORE_PATH") ;;
+          esac
+
+          run_trivy() {
+            docker run --rm \
+              -v "$GITHUB_WORKSPACE:/repo:ro" \
+              -v "$out:/out" \
+              "$TRIVY_IMAGE" \
+              fs \
+              --scanners vuln \
+              --exit-code 0 \
+              --quiet \
+              --no-progress \
+              "${ignore[@]}" \
+              "$@" \
+              "/repo/$SCAN_PATH"
+          }
+
+          # Full report (all severities); the blocking policy is applied when parsing.
+          run_trivy --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --format json --output /out/trivy.json
+          if [ "$SARIF_ENABLED" = "true" ]; then
+            # Code scanning gets the actionable findings only (same as the blocking policy).
+            run_trivy --severity CRITICAL,HIGH --ignore-unfixed --format sarif --output /out/trivy.sarif
+          fi
+
+      - name: Parse report
+        id: parse
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/trivy-out/trivy.json"
+
+          # Never report zero findings when the scan produced no report.
+          if [ ! -f "$report" ]; then
+            echo "::error::Trivy report not found at $report. The scan did not run or failed to write its output; refusing to report 0 findings."
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and has("SchemaVersion") and ((.Results // []) | type == "array")' "$report" > /dev/null; then
+            echo "::error::Trivy report is not a valid Trivy JSON document; refusing to report 0 findings."
+            exit 1
+          fi
+
+          total="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$report")"
+          # Blocking: CRITICAL/HIGH with a fixed version available.
+          blocking="$(jq '[.Results[]?.Vulnerabilities[]?
+            | select((.Severity == "CRITICAL" or .Severity == "HIGH") and ((.FixedVersion // "") != ""))] | length' "$report")"
+          echo "total-count=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking-count=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        id: summary
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          TOTAL: ${{ steps.parse.outputs.total-count }}
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/trivy-out/trivy.json"
+          {
+            echo "## Dependencies (Trivy)"
+            echo
+            echo "Scan: \`$SCAN_PATH\` | Mode: \`$MODE\`"
+            echo
+            echo "| Tool | Severity | Count |"
+            echo "|---|---|---|"
+            jq -r '[.Results[]?.Vulnerabilities[]?] as $v
+              | ("CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN") as $s
+              | "| Trivy | \($s) | \([$v[] | select(.Severity == $s)] | length) |"' "$report"
+            echo "| Trivy | **Blocking** (CRITICAL/HIGH with fix) | $BLOCKING |"
+            if [ "$TOTAL" -gt 0 ]; then
+              echo
+              echo "### Top 10 findings"
+              echo
+              echo "| ID | Severity | Package | Fixed in | Target |"
+              echo "|---|---|---|---|---|"
+              jq -r 'def esc: gsub("(?<c>[|`])"; "\\" + .c);
+                def rank: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}[.] // 4;
+                [.Results[]? | .Target as $t | .Vulnerabilities[]? | . + {target: $t}]
+                | sort_by([(.Severity | rank), ((.FixedVersion // "") == "")])
+                | .[:10][]
+                | "| \(.VulnerabilityID | esc) | \(.Severity | esc) | \((.PkgName // "-") | esc) \((.InstalledVersion // "") | esc) | \((.FixedVersion // "-") | esc) | \((.target // "-") | esc) |"' "$report"
+              if [ "$TOTAL" -gt 10 ]; then
+                echo
+                echo "_$((TOTAL - 10)) more in the \`$ARTIFACT_NAME\` artifact._"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/trivy-out/
+          if-no-files-found: error
+
+      - name: Upload SARIF to code scanning
+        id: upload-sarif
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' && steps.sarif.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/trivy.sarif
+          category: sca
+
+      - name: Warn if SARIF upload failed
+        if: ${{ steps.upload-sarif.outcome == 'failure' }}
+        run: echo "::warning::SARIF upload failed (code scanning may be unavailable for this repository or token). The scan result is not affected."
+
+      - name: Enforce policy
+        id: enforce
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "enforce" ] && [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::$BLOCKING blocking finding(s): CRITICAL/HIGH vulnerabilities with a fix available. See the job summary and the report artifact."
+            exit 1
+          fi
+          echo "Mode '$MODE': $BLOCKING blocking finding(s)."
