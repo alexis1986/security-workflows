@@ -1,0 +1,4 @@
+# Notas internas de diseño y proceso (no se publican)
+docs/superpowers/
+.superpowers/
+*.stackdump
