@@ -23,25 +23,30 @@ way: a job summary table, a raw report artifact and numeric outputs.
 
 ## Common interface
 
-Every scanning workflow exposes the same interface:
+The scanning workflows (`secrets.yml`, `sca.yml`, `sast.yml`, `iac.yml`,
+`image-scan.yml`, `dast.yml`) share one interface. `sign-sbom.yml` is not a
+scanner and has its own, described below.
 
-| Input | Default | Description |
-|---|---|---|
-| `mode` | `report` | `report` never fails on findings; `enforce` fails when there are blocking findings |
-| `scan-path` | `.` | Path to scan (not available in `dast.yml`, `sign-sbom.yml`) |
-| `upload-sarif` | `false` | Upload results to GitHub code scanning (not available in `dast.yml`, `sign-sbom.yml`) |
-| `artifact-name` | `<layer>-report` | Name of the report artifact; also the SARIF category. Use a distinct value per call when the same workflow runs more than once |
+| Input | Default | Description | Exceptions |
+|---|---|---|---|
+| `mode` | `report` | `report` never fails on findings; `enforce` fails when there are blocking findings | Not in `sign-sbom.yml` (signing has no report mode) |
+| `scan-path` | `.` | Path to scan | Not in `dast.yml` (use `target-url`) or `sign-sbom.yml` |
+| `upload-sarif` | `false` | Upload results to GitHub code scanning | Not in `dast.yml` or `sign-sbom.yml` |
+| `artifact-name` | `<layer>-report` | Name of the report artifact. Use a distinct value per call when the same workflow runs more than once | `dast.yml` defaults to `dast-report`, `sign-sbom.yml` to `sbom`. Only the SARIF layers (`secrets`, `sca`, `sast`, `iac`, `image-scan`) also use it as the SARIF category |
 
-Outputs: `blocking-count` and `total-count` (numeric strings). `image-scan.yml`
-also outputs `image-id` and `digest`.
+Outputs of the scanning workflows: `blocking-count` and `total-count` (numeric
+strings). `image-scan.yml` also outputs `image-id` and `digest`. `sign-sbom.yml`
+has no outputs: it either signs and attests the image or fails.
 
 Path inputs must be relative to the repository root and must not contain `..`.
 Every workflow validates its inputs strictly before doing anything else.
 
-Each run writes a Markdown table to the job summary (tool, severity, count, top 10
-findings) and uploads the raw report as an artifact. A report that is missing or
-malformed always fails the job: a workflow never returns `blocking-count=0`
-because a tool silently produced nothing.
+Each scanning run writes a Markdown table to the job summary (tool, severity,
+count, top 10 findings) and uploads the raw report as an artifact. A report that
+is missing or malformed always fails the job: a workflow never returns
+`blocking-count=0` because a tool silently produced nothing. `sign-sbom.yml`
+writes a short summary (signing mode, transparency log, SBOM component count) and
+uploads the SBOM.
 
 ## Required caller permissions
 
@@ -298,7 +303,7 @@ observes) through `zaproxy/action-baseline` with `fail_action: false` and
 targets you own or are authorised to test. `target-url` must be an `https` URL
 without credentials. `blocking-count` is the number of High-risk alerts;
 `total-count` covers every risk level. A scan that cannot reach the target or
-writes no report fails the job. The optional `rules-file` is a ZAP rules file
+writes no report fails the job. Besides `artifact-name`, the ZAP action uploads its own copy of the reports as `<artifact-name>-zap-action`. The optional `rules-file` is a ZAP rules file
 (tab-separated: rule id, `IGNORE`/`INFO`/`WARN`/`FAIL`, comment).
 
 ## Pipeline examples
@@ -354,7 +359,7 @@ jobs:
       image-ref: ghcr.io/<owner>/web@${{ needs.image-scan.outputs.digest }}
 
   dast:
-    needs: sign
+    needs: image-scan   # run after your deploy; the scan does not depend on signing
     permissions: { contents: read }
     uses: alexis1986/security-workflows/.github/workflows/dast.yml@main
     with:
@@ -362,9 +367,15 @@ jobs:
       target-url: https://staging.example.com
 ```
 
-### Java pipeline with a matrix of services
+### Java pipeline with several services
 
-A job that calls a reusable workflow can have its own `matrix`, so each service gets its own scan and a distinct artifact name:
+Scanning layers that take a path can be fanned out with a job-level `matrix`,
+giving each leg a distinct `artifact-name`. Images need a different pattern:
+outputs of a reusable-workflow job that uses a matrix collapse to a single leg,
+so `needs.<job>.outputs.digest` cannot be read per service. A `matrix`
+`image-scan` followed by per-service signing is therefore not supported. Use one
+explicit, non-matrix `image-scan-<service>` job per service, each feeding its own
+`sign-<service>` job:
 
 ```yaml
 jobs:
@@ -373,7 +384,7 @@ jobs:
     uses: alexis1986/security-workflows/.github/workflows/secrets.yml@main
     with: { mode: enforce }
 
-  scan:
+  sca:
     strategy:
       fail-fast: false
       matrix:
@@ -395,23 +406,48 @@ jobs:
     uses: alexis1986/security-workflows/.github/workflows/iac.yml@main
     with: { mode: enforce, scan-path: deploy, helm-chart: deploy/chart }
 
-  image-scan:
-    needs: [secrets, scan, sast, iac]
-    strategy:
-      matrix:
-        service: [orders, billing]
+  image-scan-orders:
+    needs: [secrets, sca, sast, iac]
     permissions: { contents: read, security-events: write, packages: write }
     uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
     with:
       mode: enforce
-      context: services/${{ matrix.service }}
-      image-name: ${{ matrix.service }}
-      artifact-name: image-report-${{ matrix.service }}
+      context: services/orders
+      image-name: orders
+      artifact-name: image-report-orders
       push: true
-      push-tags: ghcr.io/<owner>/${{ matrix.service }}:sha-${{ github.sha }}
+      push-tags: ghcr.io/<owner>/orders:sha-${{ github.sha }}
+
+  sign-orders:
+    needs: image-scan-orders
+    permissions: { contents: read, packages: write, id-token: write }
+    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@main
+    with:
+      image-ref: ghcr.io/<owner>/orders@${{ needs.image-scan-orders.outputs.digest }}
+      artifact-name: sbom-orders
+
+  image-scan-billing:
+    needs: [secrets, sca, sast, iac]
+    permissions: { contents: read, security-events: write, packages: write }
+    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
+    with:
+      mode: enforce
+      context: services/billing
+      image-name: billing
+      artifact-name: image-report-billing
+      push: true
+      push-tags: ghcr.io/<owner>/billing:sha-${{ github.sha }}
+
+  sign-billing:
+    needs: image-scan-billing
+    permissions: { contents: read, packages: write, id-token: write }
+    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@main
+    with:
+      image-ref: ghcr.io/<owner>/billing@${{ needs.image-scan-billing.outputs.digest }}
+      artifact-name: sbom-billing
 ```
 
-A matrix job exposes a single set of `outputs`, so sign each service with its own explicit `sign-sbom` job that depends on the matching image-scan job (or read the digest from the registry in a small job). The `dast` job is identical to the Node example.
+Add a `dast` job as in the Node example, after your deploy.
 
 ## Exceptions
 
@@ -431,24 +467,36 @@ a comment with the reason and an expiry date, in this format:
 
 ## Verifying signatures
 
-Verify by digest, never by tag.
+Signatures and attestations are stored in the cosign v3 bundle format, so
+verifiers need cosign v3 or later. Verify by digest, never by tag.
 
-Keyless (the identity is the reusable workflow that signed, because GitHub puts
-the called workflow in the certificate):
+Keyless. The certificate identity is the reusable workflow that signed (GitHub
+puts the called workflow in the certificate), and the workflow ref and trigger
+tie the signature to the caller's protected branch:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@refs/heads/main$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-github-workflow-repository <owner>/<repo> \
+  --certificate-github-workflow-ref refs/heads/main \
+  --certificate-github-workflow-trigger push \
   ghcr.io/<owner>/my-app@sha256:<digest>
 
 cosign verify-attestation --type cyclonedx \
-  --certificate-identity-regexp '^https://github.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@refs/heads/main$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-github-workflow-repository <owner>/<repo> \
+  --certificate-github-workflow-ref refs/heads/main \
+  --certificate-github-workflow-trigger push \
   ghcr.io/<owner>/my-app@sha256:<digest>
 ```
+
+The `@refs/heads/main$` suffix in the identity is the ref of the reusable
+workflow you call (`sign-sbom.yml@main`). Once you pin released versions, accept
+tags instead, for example `@refs/tags/v[0-9.]+$`. `--certificate-github-workflow-ref`
+is the ref of the repository that ran the workflow; use your release ref pattern
+(or drop the trigger flag) when you sign from tags.
 
 Key mode:
 
@@ -474,7 +522,7 @@ tracked by Dependabot and must be bumped by hand:
 - the Semgrep image tag and digest (`SEMGREP_IMAGE` in `sast.yml`)
 - the Syft image tag and digest (`SYFT_IMAGE` in `sign-sbom.yml`)
 - the cosign release (`cosign-release` of `sigstore/cosign-installer` in `sign-sbom.yml`)
-- the ZAP image tag and digest (`ZAP_IMAGE` and `docker_name` in `dast.yml`; keep both equal)
+- the ZAP image tag and digest (`ZAP_IMAGE` in `dast.yml`, also passed to the action as `docker_name`)
 - the actionlint version (`lint.yml`)
 
 `self-test.yml` runs every layer against vulnerable and clean fixtures and tests
@@ -486,9 +534,12 @@ Workflows reutilizables de GitHub Actions para añadir seguridad a un pipeline d
 CI/CD: secretos (Gitleaks), dependencias (Trivy), SAST (Semgrep), IaC e imágenes
 (Trivy), SBOM y firma de imágenes (Syft y cosign) y DAST (OWASP ZAP).
 
-- Interfaz comun: `mode` (`report` por defecto, `enforce` falla ante hallazgos
-  bloqueantes), `scan-path`, `upload-sarif`, `artifact-name`; salidas
-  `blocking-count` y `total-count`.
+- Interfaz común de las capas de análisis: `mode` (`report` por defecto, `enforce`
+  falla ante hallazgos bloqueantes), `scan-path`, `upload-sarif`, `artifact-name`;
+  salidas `blocking-count` y `total-count`. Excepciones: `dast.yml` usa
+  `target-url` en lugar de `scan-path` y no tiene `upload-sarif`; `sign-sbom.yml`
+  no tiene `mode`, `scan-path`, `upload-sarif` ni salidas de conteo (su
+  `artifact-name` es `sbom`).
 - Política de bloqueo: cualquier secreto, CRITICAL/HIGH con corrección disponible
   en dependencias e imágenes, severidad ERROR en SAST, CRITICAL/HIGH en IaC,
   alertas High en DAST. La firma no tiene modo `report`.

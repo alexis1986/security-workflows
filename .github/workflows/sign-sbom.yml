@@ -146,11 +146,16 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/sbom-out"
           mkdir -p "$out"
-          # Syft reads the image straight from the registry (registry: scheme) with
-          # the credentials written by the login step; no Docker socket is mounted.
+          # Syft reads the image straight from the registry (registry: scheme); no
+          # Docker socket is mounted. The Syft image is a scratch image whose HOME is
+          # the filesystem root, so the credentials written by the login step are
+          # exposed through DOCKER_CONFIG. This mounts the short-lived GHCR job token
+          # (read-only) into the pinned Syft container, which is needed to read
+          # private images.
           docker run --rm \
             -e SYFT_CHECK_FOR_APP_UPDATE=false \
-            -v "$HOME/.docker:/root/.docker:ro" \
+            -e DOCKER_CONFIG=/docker-config \
+            -v "$HOME/.docker:/docker-config:ro" \
             -v "$out:/out" \
             "$SYFT_IMAGE" \
             "registry:$IMAGE_REF" \
