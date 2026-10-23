@@ -1,0 +1,396 @@
+name: image-scan
+
+# Reusable workflow: build a container image and scan it with Trivy `image`.
+#
+# - Builds `context`/`dockerfile` with docker/build-push-action (push: false,
+#   load: true), tagged `<image-name>:scan`, and scans the exported image
+#   tarball. The image is never pushed and the Docker socket is never mounted
+#   into the scanner.
+# - total-count    : vulnerabilities of every severity.
+# - blocking-count : CRITICAL or HIGH vulnerabilities that have a fixed version
+#                    available (same policy as `trivy --ignore-unfixed`).
+# - Ignore file: by default the consumer's '.trivyignore' inside the build
+#   context is used when it exists, otherwise the one at the repository root
+#   (see `ignore-path`). Give every entry a comment with the reason and an expiry.
+# - SARIF: image findings have no source location, so every alert is attached
+#   to the Dockerfile (repository-relative path) to show up in code scanning.
+#
+# Build then scan then push: this workflow only builds and scans. The caller
+# pushes in a later job that has `needs:` on this one, so a failing scan in
+# `enforce` mode never leaves an unscanned image in the registry. Use the same
+# `image-name` here and in the caller's build so both share the build cache
+# (type=gha, scope=<image-name>) and the push job rebuilds from cache:
+#
+#   jobs:
+#     image-scan:
+#       permissions:
+#         contents: read
+#         security-events: write
+#       uses: <owner>/security-workflows/.github/workflows/image-scan.yml@main
+#       with:
+#         mode: enforce
+#         image-name: my-app
+#         context: .
+#       secrets:
+#         build-args: |
+#           VITE_API_KEY=${{ secrets.VITE_API_KEY }}
+#     push:
+#       needs: image-scan
+#       # docker/build-push-action with push: true, the same context and
+#       # cache-from: type=gha,scope=my-app
+#
+# `build-args` (optional secret, multiline KEY=VALUE) carries build arguments
+# that are sensitive. It is masked in logs and never echoed by this workflow.
+# Build arguments end up in the image history, so do not use it for secrets that
+# must not ship in the image; use BuildKit secret mounts in the Dockerfile for
+# those. Fork pull requests do not receive secrets, so the build runs without it.
+#
+# Permissions: the job declares `security-events: write` (needed only for SARIF
+# upload). GitHub rejects a call whose caller grants less than the called
+# workflow requests, so every caller job must grant:
+#
+#   permissions:
+#     contents: read
+#     security-events: write
+#
+# SARIF is skipped (with a warning) on fork PRs and Dependabot runs, and an
+# upload failure (e.g. no code scanning available) never fails the job.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "report (never fails on findings) or enforce (fails on blocking findings)"
+        type: string
+        default: report
+      scan-path:
+        description: "Build context directory when 'context' is empty, relative to the repository root"
+        type: string
+        default: "."
+      upload-sarif:
+        description: "Upload a SARIF report to GitHub code scanning (needs security-events: write)"
+        type: boolean
+        default: false
+      artifact-name:
+        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once. Also used as the SARIF category"
+        type: string
+        default: image-report
+      ignore-path:
+        description: "Trivy ignore file relative to the repository root. Empty: use .trivyignore in the build context, else at the root, if present. 'none': ignore any .trivyignore"
+        type: string
+        default: ""
+      context:
+        description: "Docker build context directory, relative to the repository root. Empty: use scan-path"
+        type: string
+        default: ""
+      dockerfile:
+        description: "Dockerfile path relative to the repository root. Empty: <context>/Dockerfile"
+        type: string
+        default: ""
+      image-name:
+        description: "Local image name (lowercase). Tagged <image-name>:scan and used as the build cache scope, so the caller's push build should use the same value"
+        type: string
+        default: scan-image
+    secrets:
+      build-args:
+        description: "Optional multiline KEY=VALUE build arguments (for example VITE_API_KEY=...). Masked, never echoed"
+        required: false
+    outputs:
+      blocking-count:
+        description: "Number of CRITICAL/HIGH vulnerabilities with a fix available"
+        value: ${{ jobs.image.outputs.blocking-count }}
+      total-count:
+        description: "Total number of vulnerabilities (all severities)"
+        value: ${{ jobs.image.outputs.total-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      blocking-count: ${{ steps.parse.outputs.blocking-count }}
+      total-count: ${{ steps.parse.outputs.total-count }}
+    env:
+      TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c # v0.76.1
+      MODE: ${{ inputs.mode }}
+      SCAN_PATH: ${{ inputs.scan-path }}
+      IGNORE_PATH: ${{ inputs.ignore-path }}
+      CONTEXT: ${{ inputs.context }}
+      DOCKERFILE: ${{ inputs.dockerfile }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            report|enforce) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected 'report' or 'enforce')"; exit 1 ;;
+          esac
+          case "$SCAN_PATH" in
+            /*|*..*) echo "::error::scan-path must be relative to the repository root and must not contain '..'"; exit 1 ;;
+            "") echo "::error::scan-path must not be empty"; exit 1 ;;
+          esac
+          case "$IGNORE_PATH" in
+            /*|*..*) echo "::error::ignore-path must be relative to the repository root and must not contain '..'"; exit 1 ;;
+          esac
+          case "$CONTEXT" in
+            /*|*..*) echo "::error::context must be relative to the repository root and must not contain '..'"; exit 1 ;;
+          esac
+          case "$DOCKERFILE" in
+            /*|*..*) echo "::error::dockerfile must be relative to the repository root and must not contain '..'"; exit 1 ;;
+          esac
+          if ! printf '%s' "$IMAGE_NAME" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$'; then
+            echo "::error::image-name must be lowercase letters, digits, '.', '_', '-' or '/' and start with a letter or digit"
+            exit 1
+          fi
+
+      - name: Resolve build inputs
+        id: resolve
+        run: |
+          set -euo pipefail
+          ctx="${CONTEXT:-$SCAN_PATH}"
+          ctx="${ctx#./}"
+          ctx="${ctx%/}"
+          if [ -z "$ctx" ]; then ctx="."; fi
+          df="${DOCKERFILE#./}"
+          if [ -z "$df" ]; then
+            if [ "$ctx" = "." ]; then df="Dockerfile"; else df="$ctx/Dockerfile"; fi
+          fi
+          echo "context=$ctx" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$df" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check build inputs exist
+        env:
+          RESOLVED_CONTEXT: ${{ steps.resolve.outputs.context }}
+          RESOLVED_DOCKERFILE: ${{ steps.resolve.outputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "$GITHUB_WORKSPACE/$RESOLVED_CONTEXT" ]; then
+            echo "::error::build context '$RESOLVED_CONTEXT' does not exist in the repository or is not a directory"
+            exit 1
+          fi
+          if [ ! -f "$GITHUB_WORKSPACE/$RESOLVED_DOCKERFILE" ]; then
+            echo "::error::Dockerfile '$RESOLVED_DOCKERFILE' does not exist in the repository"
+            exit 1
+          fi
+
+      - name: Decide SARIF
+        id: sarif
+        env:
+          WANT_SARIF: ${{ inputs.upload-sarif }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          enabled=false
+          if [ "$WANT_SARIF" = "true" ]; then
+            if [ "$IS_FORK_PR" = "true" ] || [ "$ACTOR" = "dependabot[bot]" ]; then
+              echo "::warning::SARIF upload skipped: fork and Dependabot runs have a read-only token."
+            else
+              enabled=true
+            fi
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ steps.resolve.outputs.context }}
+          file: ${{ steps.resolve.outputs.dockerfile }}
+          push: false
+          load: true
+          provenance: false
+          tags: ${{ inputs.image-name }}:scan
+          build-args: ${{ secrets.build-args }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          cache-to: type=gha,scope=${{ inputs.image-name }},mode=max,ignore-error=true
+
+      - name: Run Trivy
+        id: scan
+        env:
+          SARIF_ENABLED: ${{ steps.sarif.outputs.enabled }}
+          RESOLVED_CONTEXT: ${{ steps.resolve.outputs.context }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/trivy-out"
+          in="$RUNNER_TEMP/image-in"
+          mkdir -p "$out" "$in"
+
+          ignore=()
+          case "$IGNORE_PATH" in
+            none) ;;
+            "")
+              if [ -f "$GITHUB_WORKSPACE/$RESOLVED_CONTEXT/.trivyignore" ]; then
+                ignore=(--ignorefile "/repo/$RESOLVED_CONTEXT/.trivyignore")
+              elif [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
+                ignore=(--ignorefile /repo/.trivyignore)
+              fi ;;
+            *)
+              if [ ! -f "$GITHUB_WORKSPACE/$IGNORE_PATH" ]; then
+                echo "::error::ignore-path '$IGNORE_PATH' does not exist in the repository"
+                exit 1
+              fi
+              ignore=(--ignorefile "/repo/$IGNORE_PATH") ;;
+          esac
+
+          # Export the image to a tarball: the scanner reads it with --input, so
+          # the Docker socket is not exposed to the scanner container.
+          docker save "$IMAGE_NAME:scan" --output "$in/image.tar"
+
+          # Full report (all severities); the blocking policy is applied when parsing.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$in:/in:ro" \
+            -v "$out:/out" \
+            "$TRIVY_IMAGE" \
+            image \
+            --input /in/image.tar \
+            --scanners vuln \
+            --exit-code 0 \
+            --no-progress \
+            "${ignore[@]}" \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output /out/trivy.json
+
+          if [ "$SARIF_ENABLED" = "true" ]; then
+            # SARIF from the same scan (no second run). Same content policy as the
+            # JSON report: every severity is uploaded.
+            docker run --rm \
+              -v "$out:/out" \
+              "$TRIVY_IMAGE" \
+              convert \
+              --format sarif \
+              --output /out/trivy.sarif \
+              /out/trivy.json
+          fi
+
+      - name: Point SARIF locations at the Dockerfile
+        id: sarif-paths
+        if: ${{ steps.sarif.outputs.enabled == 'true' }}
+        env:
+          RESOLVED_DOCKERFILE: ${{ steps.resolve.outputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          sarif="$RUNNER_TEMP/trivy-out/trivy.sarif"
+          # Image findings are located inside image layers, which code scanning
+          # cannot resolve. Attach every alert to the Dockerfile instead.
+          tmp="$sarif.tmp"
+          jq --arg f "$RESOLVED_DOCKERFILE" '
+            (.runs[]?.results[]?) |= (
+              .locations = [{"physicalLocation": {"artifactLocation": {"uri": $f}, "region": {"startLine": 1}}}]
+            )
+          ' "$sarif" > "$tmp"
+          mv "$tmp" "$sarif"
+
+      - name: Parse report
+        id: parse
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/trivy-out/trivy.json"
+
+          # Never report zero findings when the scan produced no report.
+          if [ ! -f "$report" ]; then
+            echo "::error::Trivy report not found at $report. The scan did not run or failed to write its output; refusing to report 0 findings."
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and has("SchemaVersion") and ((.Results // []) | type == "array")' "$report" > /dev/null; then
+            echo "::error::Trivy report is not a valid Trivy JSON document; refusing to report 0 findings."
+            exit 1
+          fi
+
+          total="$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$report")"
+          # Blocking: CRITICAL/HIGH with a fixed version available.
+          blocking="$(jq '[.Results[]?.Vulnerabilities[]?
+            | select((.Severity == "CRITICAL" or .Severity == "HIGH") and ((.FixedVersion // "") != ""))] | length' "$report")"
+          echo "total-count=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking-count=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        id: summary
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          TOTAL: ${{ steps.parse.outputs.total-count }}
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/trivy-out/trivy.json"
+          safe_path="$(printf '%s' "$SCAN_PATH" | tr -c 'A-Za-z0-9_./-' '?')"
+          safe_image="$(printf '%s' "$IMAGE_NAME" | tr -c 'A-Za-z0-9_./-' '?')"
+          {
+            echo "## Container image (Trivy)"
+            echo
+            echo "Image: \`$safe_image\` | Scan: \`$safe_path\` | Mode: \`$MODE\`"
+            echo
+            echo "| Tool | Severity | Count |"
+            echo "|---|---|---|"
+            jq -r '[.Results[]?.Vulnerabilities[]?] as $v
+              | ("CRITICAL","HIGH","MEDIUM","LOW","UNKNOWN") as $s
+              | "| Trivy | \($s) | \([$v[] | select(.Severity == $s)] | length) |"' "$report"
+            echo "| Trivy | **Blocking** (CRITICAL/HIGH with fix) | $BLOCKING |"
+            if [ "$TOTAL" -gt 0 ]; then
+              echo
+              echo "### Top 10 findings"
+              echo
+              echo "| ID | Severity | Package | Fixed in | Target |"
+              echo "|---|---|---|---|---|"
+              jq -r 'def esc: gsub("(?<c>[|`])"; "\\" + .c);
+                def rank: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}[.] // 4;
+                [.Results[]? | .Target as $t | .Vulnerabilities[]? | . + {target: $t}]
+                | sort_by([(.Severity | rank), ((.FixedVersion // "") == "")])
+                | .[:10][]
+                | "| \(.VulnerabilityID | esc) | \(.Severity | esc) | \((.PkgName // "-") | esc) \((.InstalledVersion // "") | esc) | \((.FixedVersion // "-") | esc) | \((.target // "-") | esc) |"' "$report"
+              if [ "$TOTAL" -gt 10 ]; then
+                echo
+                echo "_$((TOTAL - 10)) more in the \`$ARTIFACT_NAME\` artifact._"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/trivy-out/
+          if-no-files-found: error
+
+      - name: Upload SARIF to code scanning
+        id: upload-sarif
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' && steps.sarif.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/trivy.sarif
+          category: ${{ inputs.artifact-name }}
+
+      - name: Warn if SARIF upload failed
+        if: ${{ steps.upload-sarif.outcome == 'failure' }}
+        run: echo "::warning::SARIF upload failed (code scanning may be unavailable for this repository or token). The scan result is not affected."
+
+      - name: Enforce policy
+        id: enforce
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "enforce" ] && [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::$BLOCKING blocking finding(s): CRITICAL/HIGH vulnerabilities with a fix available. See the job summary and the report artifact."
+            exit 1
+          fi
+          echo "Mode '$MODE': $BLOCKING blocking finding(s)."

@@ -1,0 +1,12 @@
+# Intentionally insecure fixture for the IaC self-test: privileged container.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insecure-example
+spec:
+  containers:
+    - name: app
+      image: alpine:3.20
+      command: ["sleep", "infinity"]
+      securityContext:
+        privileged: true

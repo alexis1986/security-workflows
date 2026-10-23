@@ -21,8 +21,8 @@ Outputs: `blocking-count` and `total-count`.
 | Secrets | `secrets.yml` | Gitleaks | Available |
 | Dependencies (SCA) | `sca.yml` | Trivy | Available |
 | SAST | `sast.yml` | Semgrep CE | Available |
-| IaC | `iac.yml` | Trivy config | Planned |
-| Image scan | `image-scan.yml` | Trivy image | Planned |
+| IaC | `iac.yml` | Trivy config | Available |
+| Image scan | `image-scan.yml` | Trivy image | Available |
 | SBOM and signing | `sign-sbom.yml` | Syft, cosign | Planned |
 | DAST | `dast.yml` | OWASP ZAP | Planned |
 
@@ -110,7 +110,93 @@ too). A warning is emitted when Semgrep returns partial results. Exceptions go i
 `.semgrepignore` at the repository root, each with a comment stating the reason
 and an expiry. Metrics are disabled.
 
-More usage examples will be added as each layer lands.
+### IaC with Trivy
+
+```yaml
+jobs:
+  iac:
+    permissions:
+      contents: read
+      security-events: write
+    uses: alexis1986/security-workflows/.github/workflows/iac.yml@main
+    with:
+      mode: enforce
+      upload-sarif: true
+      scan-path: deploy
+      helm-chart: deploy/chart   # optional
+      artifact-name: iac-report
+```
+
+Scans Dockerfiles, Kubernetes manifests, Terraform and CloudFormation under
+`scan-path` (a directory) with `trivy config`. Misconfigurations have no "fixed
+version", so `blocking-count` is the number of CRITICAL or HIGH findings;
+`total-count` covers every severity. With `helm-chart`, the chart is rendered
+with `helm template` (default values; dependencies must be vendored) and the
+rendered manifests are scanned too, reported against the chart path. Exceptions
+go in a `.trivyignore` (`ignore-path` works as in the SCA layer), each with a
+comment stating the reason and an expiry.
+
+### Container image with Trivy
+
+`image-scan.yml` builds the image (no push) and scans it. Build, scan and push
+are separate jobs: the push job in your workflow declares `needs:` on the scan,
+so a failing scan in `enforce` mode never leaves an unscanned image in the
+registry. Use the same `image-name` in both so they share the build cache scope
+and the push job rebuilds from cache.
+
+```yaml
+jobs:
+  image-scan:
+    permissions:
+      contents: read
+      security-events: write
+    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
+    with:
+      mode: enforce
+      upload-sarif: true
+      context: .
+      dockerfile: Dockerfile
+      image-name: my-app
+      artifact-name: image-report
+    secrets:
+      build-args: |
+        VITE_API_KEY=${{ secrets.VITE_API_KEY }}
+
+  push:
+    needs: image-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@<sha>
+      - uses: docker/setup-buildx-action@<sha>
+      - uses: docker/login-action@<sha>
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@<sha>
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/<owner>/my-app:latest
+          build-args: |
+            VITE_API_KEY=${{ secrets.VITE_API_KEY }}
+          cache-from: type=gha,scope=my-app
+```
+
+The image is built with `push: false` and `load: true`, exported to a tarball and
+scanned with `trivy image --input` (the Docker socket is never mounted into the
+scanner). `blocking-count` is the number of CRITICAL or HIGH vulnerabilities that
+have a fixed version available; `total-count` covers every severity. In the SARIF
+every alert is attached to the Dockerfile, since image findings have no source
+location. The optional secret `build-args` takes multiline `KEY=VALUE` build
+arguments; it is masked and never echoed. Build arguments end up in the image
+history, so keep truly confidential values out of them (use BuildKit secret
+mounts). Fork pull requests do not receive secrets, so their build runs without
+`build-args`. `context` defaults to `scan-path`; `dockerfile` defaults to
+`<context>/Dockerfile`.
 
 ## Maintenance
 
@@ -118,7 +204,8 @@ Dependabot keeps the pinned GitHub Actions up to date. These pins are not
 tracked by Dependabot and must be bumped by hand:
 
 - the Gitleaks image tag and digest (`GITLEAKS_IMAGE` in `secrets.yml`)
-- the Trivy image tag and digest (`TRIVY_IMAGE` in `sca.yml`)
+- the Trivy image tag and digest (`TRIVY_IMAGE` in `sca.yml`, `iac.yml` and `image-scan.yml`)
+- the Helm version used to render charts (`version` of `azure/setup-helm` in `iac.yml`)
 - the Semgrep image tag and digest (`SEMGREP_IMAGE` in `sast.yml`)
 - the actionlint version (`lint.yml`)
 

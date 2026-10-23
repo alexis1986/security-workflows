@@ -175,6 +175,96 @@ jobs:
           esac
           exit "$fail"
 
+  # -------------------------------------------------------------------- iac
+  call-iac-vulnerable:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/iac.yml
+    with:
+      mode: report
+      scan-path: fixtures/vulnerable/iac
+      artifact-name: iac-report-vulnerable
+      ignore-path: none
+
+  call-iac-clean:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/iac.yml
+    with:
+      mode: report
+      scan-path: fixtures/clean/iac
+      artifact-name: iac-report-clean
+      ignore-path: none
+
+  assert-iac:
+    needs: [call-iac-vulnerable, call-iac-clean]
+    runs-on: ubuntu-latest
+    env:
+      VULNERABLE_BLOCKING: ${{ needs.call-iac-vulnerable.outputs.blocking-count }}
+      CLEAN_BLOCKING: ${{ needs.call-iac-clean.outputs.blocking-count }}
+    steps:
+      - name: Assert expected counts
+        run: |
+          set -euo pipefail
+          fail=0
+          echo "vulnerable blocking-count: '$VULNERABLE_BLOCKING' (expected >= 1)"
+          echo "clean blocking-count:      '$CLEAN_BLOCKING' (expected 0)"
+          case "$VULNERABLE_BLOCKING" in ''|*[!0-9]*) echo "::error::vulnerable blocking-count is not numeric"; fail=1 ;;
+            *) [ "$VULNERABLE_BLOCKING" -ge 1 ] || { echo "::error::Trivy found nothing in the vulnerable fixture (false green)"; fail=1; } ;;
+          esac
+          case "$CLEAN_BLOCKING" in ''|*[!0-9]*) echo "::error::clean blocking-count is not numeric"; fail=1 ;;
+            *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Trivy reported findings in the clean fixture"; fail=1; } ;;
+          esac
+          exit "$fail"
+
+  # ------------------------------------------------------------------ image
+  call-image-vulnerable:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/image-scan.yml
+    with:
+      mode: report
+      context: fixtures/vulnerable/image
+      image-name: fixture-vulnerable
+      artifact-name: image-report-vulnerable
+      ignore-path: none
+
+  call-image-clean:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/image-scan.yml
+    with:
+      mode: report
+      context: fixtures/clean/image
+      image-name: fixture-clean
+      artifact-name: image-report-clean
+      ignore-path: none
+
+  assert-image:
+    needs: [call-image-vulnerable, call-image-clean]
+    runs-on: ubuntu-latest
+    env:
+      VULNERABLE_BLOCKING: ${{ needs.call-image-vulnerable.outputs.blocking-count }}
+      CLEAN_BLOCKING: ${{ needs.call-image-clean.outputs.blocking-count }}
+    steps:
+      - name: Assert expected counts
+        run: |
+          set -euo pipefail
+          fail=0
+          echo "vulnerable blocking-count: '$VULNERABLE_BLOCKING' (expected >= 1)"
+          echo "clean blocking-count:      '$CLEAN_BLOCKING' (expected 0)"
+          case "$VULNERABLE_BLOCKING" in ''|*[!0-9]*) echo "::error::vulnerable blocking-count is not numeric"; fail=1 ;;
+            *) [ "$VULNERABLE_BLOCKING" -ge 1 ] || { echo "::error::Trivy found nothing in the vulnerable image (false green)"; fail=1; } ;;
+          esac
+          case "$CLEAN_BLOCKING" in ''|*[!0-9]*) echo "::error::clean blocking-count is not numeric"; fail=1 ;;
+            *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Trivy reported blocking findings in the clean image"; fail=1; } ;;
+          esac
+          exit "$fail"
+
   # Failure-path tests for the scripts embedded in each reusable workflow. The
   # scripts are extracted by step id and run with simulated inputs.
   test-scripts:
@@ -330,5 +420,76 @@ jobs:
           echo '{"results":[],"errors":[{"type":"PartialParsing","message":"x"}]}' > "$work/se/semgrep-out/semgrep.json"
           expect yes "semgrep: parse succeeds on a report with errors" env RUNNER_TEMP="$work/se" GITHUB_OUTPUT="$work/se.out" bash "$work/semgrep-parse.sh"
           if grep -q '^::warning::Semgrep reported 1 error' "$work/out.log"; then echo "ok   - semgrep: parse warns on partial results"; else echo "::error::FAIL - semgrep: no warning for partial results"; cat "$work/out.log"; failures=$((failures + 1)); fi
+
+          # ---------------------------------------------------------------- iac
+          # 3 misconfigurations: HIGH, CRITICAL (blocking), LOW.
+          iac_findings='{"SchemaVersion":2,"Results":[{"Target":"Dockerfile","Misconfigurations":[
+            {"ID":"DS-0002","Severity":"HIGH","Title":"root user"},
+            {"ID":"KSV-9999","Severity":"CRITICAL","Title":"t"},
+            {"ID":"DS-0026","Severity":"LOW","Title":"no healthcheck"}]}]}'
+          check_layer iac.yml trivy trivy-out trivy.json \
+            '{"error": true}' '{"SchemaVersion":2}' "$iac_findings" 2 3
+          check_validate iac.yml trivy IGNORE_PATH= HELM_CHART=
+          expect no  "iac: validate rejects an absolute ignore-path" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH=/etc/x HELM_CHART= bash "$work/trivy-validate.sh"
+          expect no  "iac: validate rejects an absolute helm-chart" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= HELM_CHART=/etc/chart bash "$work/trivy-validate.sh"
+          expect no  "iac: validate rejects a helm-chart with '..'" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= HELM_CHART=../chart bash "$work/trivy-validate.sh"
+          expect yes "iac: validate accepts a relative helm-chart" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= HELM_CHART=deploy/chart bash "$work/trivy-validate.sh"
+
+          # SARIF: the uriBaseId is dropped and absolute paths are refused.
+          extract iac.yml trivy sarif-paths
+          mkdir -p "$work/ip1/trivy-out" "$work/ip2/trivy-out"
+          echo '{"runs":[{"results":[{"locations":[{"physicalLocation":{"artifactLocation":{"uri":"deploy/pod.yaml","uriBaseId":"ROOTPATH"}}}]}]}]}' > "$work/ip1/trivy-out/trivy.sarif"
+          expect yes "iac: sarif-paths accepts repository-relative locations" env RUNNER_TEMP="$work/ip1" bash "$work/trivy-sarif-paths.sh"
+          got="$(jq -r '.runs[0].results[0].locations[0].physicalLocation.artifactLocation | .uri + (if has("uriBaseId") then " HAS-BASEID" else "" end)' "$work/ip1/trivy-out/trivy.sarif")"
+          if [ "$got" = "deploy/pod.yaml" ]; then echo "ok   - iac: sarif uri kept and uriBaseId removed"; else echo "::error::FAIL - iac: sarif uri is '$got'"; failures=$((failures + 1)); fi
+          echo '{"runs":[{"results":[{"locations":[{"physicalLocation":{"artifactLocation":{"uri":"/tmp/x.yaml"}}}]}]}]}' > "$work/ip2/trivy-out/trivy.sarif"
+          expect no "iac: sarif-paths refuses absolute locations" env RUNNER_TEMP="$work/ip2" bash "$work/trivy-sarif-paths.sh"
+
+          # -------------------------------------------------------------- image
+          # 3 vulns: HIGH with fix (blocking), CRITICAL without fix, LOW with fix.
+          image_findings='{"SchemaVersion":2,"Results":[{"Target":"app (alpine 3.15)","Vulnerabilities":[
+            {"VulnerabilityID":"CVE-1","Severity":"HIGH","FixedVersion":"1.0.1","PkgName":"a","InstalledVersion":"1.0.0"},
+            {"VulnerabilityID":"CVE-2","Severity":"CRITICAL","PkgName":"b","InstalledVersion":"1.0.0"},
+            {"VulnerabilityID":"CVE-3","Severity":"LOW","FixedVersion":"2.0.0","PkgName":"c","InstalledVersion":"1.0.0"}]}]}'
+          check_layer image-scan.yml image trivy-out trivy.json \
+            '{"error": true}' '{"SchemaVersion":2}' "$image_findings" 1 3
+          check_validate image-scan.yml image IGNORE_PATH= CONTEXT= DOCKERFILE= IMAGE_NAME=my-app
+          expect no  "image: validate rejects an absolute context" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT=/etc DOCKERFILE= IMAGE_NAME=my-app bash "$work/image-validate.sh"
+          expect no  "image: validate rejects a context with '..'" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT=../x DOCKERFILE= IMAGE_NAME=my-app bash "$work/image-validate.sh"
+          expect no  "image: validate rejects an absolute dockerfile" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE=/etc/passwd IMAGE_NAME=my-app bash "$work/image-validate.sh"
+          expect no  "image: validate rejects a dockerfile with '..'" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE=../Dockerfile IMAGE_NAME=my-app bash "$work/image-validate.sh"
+          for bad in "" "My-App" "app:tag" 'app;id' "-app" 'a b'; do
+            expect no  "image: validate rejects image-name '$bad'" \
+              env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT= DOCKERFILE= IMAGE_NAME="$bad" bash "$work/image-validate.sh"
+          done
+          expect yes "image: validate accepts a registry-style image-name" \
+            env MODE=report SCAN_PATH=. IGNORE_PATH= CONTEXT=backend DOCKERFILE=backend/Dockerfile IMAGE_NAME=org/my-app.v2 bash "$work/image-validate.sh"
+
+          # Build input resolution: context falls back to scan-path; the
+          # Dockerfile defaults to <context>/Dockerfile.
+          extract image-scan.yml image resolve
+          for case in "|.||.|Dockerfile" "|backend||backend|backend/Dockerfile" "|./backend/||backend|backend/Dockerfile" "svc|.||svc|svc/Dockerfile" "svc|.|./ops/Dockerfile|svc|ops/Dockerfile"; do
+            IFS='|' read -r c sp d ec ed <<< "$case"
+            : > "$work/res.out"
+            env CONTEXT="$c" SCAN_PATH="$sp" DOCKERFILE="$d" GITHUB_OUTPUT="$work/res.out" bash "$work/image-resolve.sh"
+            expect_line "$work/res.out" "context=$ec" "image: resolve (context '$c', scan-path '$sp') -> context=$ec"
+            expect_line "$work/res.out" "dockerfile=$ed" "image: resolve (context '$c', dockerfile '$d') -> dockerfile=$ed"
+          done
+
+          # SARIF: every alert is attached to the Dockerfile.
+          extract image-scan.yml image sarif-paths
+          mkdir -p "$work/is/trivy-out"
+          echo '{"runs":[{"results":[{"ruleId":"CVE-1","locations":[{"physicalLocation":{"artifactLocation":{"uri":"library/node","uriBaseId":"ROOTPATH"}}}]},{"ruleId":"CVE-2"}]}]}' > "$work/is/trivy-out/trivy.sarif"
+          expect yes "image: sarif-paths runs" env RUNNER_TEMP="$work/is" RESOLVED_DOCKERFILE=svc/Dockerfile bash "$work/image-sarif-paths.sh"
+          got="$(jq -c '[.runs[0].results[] | .locations[0].physicalLocation.artifactLocation]' "$work/is/trivy-out/trivy.sarif")"
+          if [ "$got" = '[{"uri":"svc/Dockerfile"},{"uri":"svc/Dockerfile"}]' ]; then echo "ok   - image: sarif locations point at the Dockerfile"; else echo "::error::FAIL - image: sarif locations are $got"; failures=$((failures + 1)); fi
 
           exit "$failures"
