@@ -47,7 +47,9 @@ jobs:
 
 Additional input shared by all layers: `artifact-name` (default `<layer>-report`).
 Use a distinct value per call when you call the same workflow more than once in a
-run. `secrets.yml` also accepts `config-path` (default: `.gitleaks.toml` at the
+run. The same value is used as the SARIF category, so two calls to one layer
+(for example `backend/` and `frontend/`) never overwrite each other's code
+scanning results. `secrets.yml` also accepts `config-path` (default: `.gitleaks.toml` at the
 repository root when present; `none` uses the Gitleaks defaults); path inputs
 must be relative to the repository root and must not contain `..`.
 
@@ -70,6 +72,11 @@ jobs:
 ```
 
 Scans the lockfiles and manifests under `scan-path` (pnpm, npm, Maven, ...).
+Maven dependencies are resolved against public Maven Central only: parents and
+BOMs from private repositories are not resolved, so the dependency list can be
+incomplete. The workflow emits a warning when Trivy reports such problems, but
+it cannot make the result complete. SARIF is produced from the same scan and
+includes every severity, with paths relative to the repository root.
 `blocking-count` is the number of CRITICAL or HIGH vulnerabilities that have a
 fixed version available; `total-count` covers every severity. Exceptions go in
 a `.trivyignore` inside `scan-path` or at the repository root (input
@@ -98,7 +105,8 @@ jobs:
 Runs Semgrep Community Edition with the rule sources listed in `rulesets`
 (registry packs or rule files in the repository; default `p/typescript p/java
 p/owasp-top-ten`). `blocking-count` is the number of findings with severity
-ERROR; `total-count` covers every severity. Exceptions go in a
+ERROR; `total-count` covers every severity (the SARIF includes every severity
+too). A warning is emitted when Semgrep returns partial results. Exceptions go in a
 `.semgrepignore` at the repository root, each with a comment stating the reason
 and an expiry. Metrics are disabled.
 

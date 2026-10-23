@@ -177,6 +177,13 @@ jobs:
             exit 1
           fi
 
+          # Semgrep can finish with partial results (rule or parse errors).
+          errors="$(jq '(.errors // []) | length' "$report")"
+          if [ "$errors" -gt 0 ]; then
+            kinds="$(jq -r '[(.errors // [])[] | (.type | tostring)] | unique | join(", ")' "$report" | tr -c 'A-Za-z0-9_, "[]-' '?')"
+            echo "::warning::Semgrep reported $errors error(s) ($kinds); results may be partial. See the report artifact."
+          fi
+
           total="$(jq '.results | length' "$report")"
           # Blocking: severity ERROR.
           blocking="$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' "$report")"
@@ -193,10 +200,11 @@ jobs:
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/semgrep-out/semgrep.json"
+          safe_path="$(printf '%s' "$SCAN_PATH" | tr -c 'A-Za-z0-9_./-' '?')"
           {
             echo "## SAST (Semgrep)"
             echo
-            echo "Scan: \`$SCAN_PATH\` | Mode: \`$MODE\` | Rules: \`$RULESETS\`"
+            echo "Scan: \`$safe_path\` | Mode: \`$MODE\` | Rules: \`$RULESETS\`"
             echo
             echo "| Tool | Severity | Count |"
             echo "|---|---|---|"
@@ -238,7 +246,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: ${{ runner.temp }}/semgrep-out/semgrep.sarif
-          category: sast
+          category: ${{ inputs.artifact-name }}
 
       - name: Warn if SARIF upload failed
         if: ${{ steps.upload-sarif.outcome == 'failure' }}

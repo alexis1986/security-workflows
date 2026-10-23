@@ -294,6 +294,21 @@ jobs:
           expect no  "trivy: validate rejects an ignore-path with '..'" \
             env MODE=report SCAN_PATH=. IGNORE_PATH=../x bash "$work/trivy-validate.sh"
 
+          # SARIF locations are made repository-relative (Trivy reports them
+          # relative to the scan root and sets a bogus uriBaseId).
+          extract sca.yml trivy sarif-paths
+          sarif_sample='{"runs":[{"results":[{"locations":[{"physicalLocation":{"artifactLocation":{"uri":"pom.xml","uriBaseId":"ROOTPATH"}}}]}]}]}'
+          i=0
+          for case in "backend:backend/pom.xml" "./backend/:backend/pom.xml" "a/b:a/b/pom.xml" ".:pom.xml"; do
+            i=$((i + 1))
+            sp="${case%%:*}"; exp_uri="${case#*:}"
+            mkdir -p "$work/sp$i/trivy-out"
+            echo "$sarif_sample" > "$work/sp$i/trivy-out/trivy.sarif"
+            expect yes "trivy: sarif-paths runs for scan-path '$sp'" env RUNNER_TEMP="$work/sp$i" SCAN_PATH="$sp" bash "$work/trivy-sarif-paths.sh"
+            got="$(jq -r '.runs[0].results[0].locations[0].physicalLocation.artifactLocation | .uri + (if has("uriBaseId") then " HAS-BASEID" else "" end)' "$work/sp$i/trivy-out/trivy.sarif")"
+            if [ "$got" = "$exp_uri" ]; then echo "ok   - trivy: sarif uri for scan-path '$sp' is '$exp_uri'"; else echo "::error::FAIL - trivy: sarif uri for '$sp' is '$got', expected '$exp_uri'"; failures=$((failures + 1)); fi
+          done
+
           # --------------------------------------------------------------- sast
           # 3 results: two ERROR (blocking), one WARNING.
           sast_findings='{"results":[
@@ -309,5 +324,11 @@ jobs:
             env MODE=report SCAN_PATH=. RULESETS='p/java;id' bash "$work/semgrep-validate.sh"
           expect no  "semgrep: validate rejects a rulesets path with '..'" \
             env MODE=report SCAN_PATH=. RULESETS='../rules' bash "$work/semgrep-validate.sh"
+
+          # Partial Semgrep results (.errors) must surface as a warning without failing.
+          mkdir -p "$work/se/semgrep-out"
+          echo '{"results":[],"errors":[{"type":"PartialParsing","message":"x"}]}' > "$work/se/semgrep-out/semgrep.json"
+          expect yes "semgrep: parse succeeds on a report with errors" env RUNNER_TEMP="$work/se" GITHUB_OUTPUT="$work/se.out" bash "$work/semgrep-parse.sh"
+          if grep -q '^::warning::Semgrep reported 1 error' "$work/out.log"; then echo "ok   - semgrep: parse warns on partial results"; else echo "::error::FAIL - semgrep: no warning for partial results"; cat "$work/out.log"; failures=$((failures + 1)); fi
 
           exit "$failures"

@@ -139,27 +139,71 @@ jobs:
               ignore=(--ignorefile "/repo/$IGNORE_PATH") ;;
           esac
 
-          run_trivy() {
-            docker run --rm \
-              -v "$GITHUB_WORKSPACE:/repo:ro" \
-              -v "$out:/out" \
-              "$TRIVY_IMAGE" \
-              fs \
-              --scanners vuln \
-              --exit-code 0 \
-              --quiet \
-              --no-progress \
-              "${ignore[@]}" \
-              "$@" \
-              "/repo/$SCAN_PATH"
-          }
+          log="$RUNNER_TEMP/trivy.log"
 
           # Full report (all severities); the blocking policy is applied when parsing.
-          run_trivy --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --format json --output /out/trivy.json
-          if [ "$SARIF_ENABLED" = "true" ]; then
-            # Code scanning gets the actionable findings only (same as the blocking policy).
-            run_trivy --severity CRITICAL,HIGH --ignore-unfixed --format sarif --output /out/trivy.sarif
+          # Debug output is captured because Trivy only logs Maven resolution
+          # failures (unresolvable parents/BOMs) at debug level; everything that is
+          # not DEBUG is still shown in this step's log.
+          rc=0
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$out:/out" \
+            "$TRIVY_IMAGE" \
+            fs \
+            --scanners vuln \
+            --exit-code 0 \
+            --no-progress \
+            --debug \
+            "${ignore[@]}" \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output /out/trivy.json \
+            "/repo/$SCAN_PATH" 2> "$log" || rc=$?
+          tab=$'\t'
+          grep -v -F "${tab}DEBUG${tab}" "$log" >&2 || true
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
+          # Resolution problems mean the dependency list may be incomplete (for
+          # example Maven parents/BOMs from private repositories, which are not
+          # resolved), which would otherwise look like a clean result.
+          pattern="${tab}(WARN|ERROR)${tab}|\[pom\] (Failed to fetch|Parent POM not found)|was not found in local/remote"
+          if grep -q -E "$pattern" "$log"; then
+            echo "::warning::Trivy reported resolution problems; the dependency list may be incomplete (only public Maven Central is resolved). First messages follow."
+            grep -E "$pattern" "$log" | cut -c1-300 | sort -u | head -10 | while IFS= read -r line; do
+              echo "::warning::Trivy: ${line//[$'\r\n']/ }"
+            done
           fi
+
+          if [ "$SARIF_ENABLED" = "true" ]; then
+            # SARIF from the same scan (no second run). Same content policy as the
+            # JSON report and the Semgrep SARIF: every severity is uploaded.
+            docker run --rm \
+              -v "$out:/out" \
+              "$TRIVY_IMAGE" \
+              convert \
+              --format sarif \
+              --output /out/trivy.sarif \
+              /out/trivy.json
+          fi
+
+      - name: Make SARIF paths repository-relative
+        id: sarif-paths
+        if: ${{ steps.sarif.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          sarif="$RUNNER_TEMP/trivy-out/trivy.sarif"
+          # Trivy reports locations relative to the scan root; code scanning needs
+          # repository-relative paths, so prefix them with scan-path.
+          prefix="${SCAN_PATH#./}"
+          prefix="${prefix%/}"
+          if [ "$prefix" = "." ] || [ -z "$prefix" ]; then prefix=""; fi
+          tmp="$sarif.tmp"
+          jq --arg p "$prefix" '
+            (.runs[]?.results[]?.locations[]?.physicalLocation.artifactLocation)
+              |= ((if $p == "" then . else .uri = ($p + "/" + .uri) end) | del(.uriBaseId))
+          ' "$sarif" > "$tmp"
+          mv "$tmp" "$sarif"
 
       - name: Parse report
         id: parse
@@ -194,10 +238,11 @@ jobs:
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/trivy-out/trivy.json"
+          safe_path="$(printf '%s' "$SCAN_PATH" | tr -c 'A-Za-z0-9_./-' '?')"
           {
             echo "## Dependencies (Trivy)"
             echo
-            echo "Scan: \`$SCAN_PATH\` | Mode: \`$MODE\`"
+            echo "Scan: \`$safe_path\` | Mode: \`$MODE\`"
             echo
             echo "| Tool | Severity | Count |"
             echo "|---|---|---|"
@@ -239,7 +284,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: ${{ runner.temp }}/trivy-out/trivy.sarif
-          category: sca
+          category: ${{ inputs.artifact-name }}
 
       - name: Warn if SARIF upload failed
         if: ${{ steps.upload-sarif.outcome == 'failure' }}
