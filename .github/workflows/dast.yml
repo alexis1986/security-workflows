@@ -1,0 +1,222 @@
+name: dast
+
+# Reusable workflow: dynamic scan (DAST) of a running web application with the
+# OWASP ZAP baseline scan (zaproxy/action-baseline).
+#
+# - The baseline scan is passive: it spiders `target-url` and reports what it can
+#   observe without attacking it. Only scan targets you own or are authorised to test.
+# - total-count    : alerts of every risk level reported by ZAP.
+# - blocking-count : alerts with risk High (ZAP riskcode 3).
+# - The action is run with `fail_action: false` and `allow_issue_writing: false`:
+#   findings never fail the scan step and no GitHub issue is created. The policy
+#   is applied by this workflow (`mode`) from the parsed JSON report. A scan that
+#   cannot reach the target, or that writes no report, always fails the job.
+# - `rules-file` (optional, relative to the repository root) is a ZAP rules
+#   configuration file (tab-separated: rule id, IGNORE|INFO|WARN|FAIL, comment).
+#   Use it for exceptions and give every entry a reason and an expiry in the
+#   comment column, for example `10020<TAB>IGNORE<TAB>(reason - expires 2026-12-31)`.
+# - Common interface: `mode`, `artifact-name`, outputs `blocking-count` and
+#   `total-count`. `scan-path` and `upload-sarif` do not apply to DAST (no
+#   source location) and are not accepted.
+#
+#   jobs:
+#     dast:
+#       permissions:
+#         contents: read
+#       uses: <owner>/security-workflows/.github/workflows/dast.yml@main
+#       with:
+#         mode: enforce
+#         target-url: https://staging.example.com
+#
+# Permissions: only `contents: read` (to read `rules-file`).
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "report (never fails on findings) or enforce (fails on High-risk alerts)"
+        type: string
+        default: report
+      target-url:
+        description: "https URL of the application to scan, without credentials"
+        type: string
+        required: true
+      rules-file:
+        description: "Optional ZAP rules configuration file, relative to the repository root (no '..')"
+        type: string
+        default: ""
+      artifact-name:
+        description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once"
+        type: string
+        default: dast-report
+    outputs:
+      blocking-count:
+        description: "Number of High-risk alerts"
+        value: ${{ jobs.zap.outputs.blocking-count }}
+      total-count:
+        description: "Total number of alerts (all risk levels)"
+        value: ${{ jobs.zap.outputs.total-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  zap:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      blocking-count: ${{ steps.parse.outputs.blocking-count }}
+      total-count: ${{ steps.parse.outputs.total-count }}
+    env:
+      ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6 # v2.17.0
+      MODE: ${{ inputs.mode }}
+      TARGET_URL: ${{ inputs.target-url }}
+      RULES_FILE: ${{ inputs.rules-file }}
+      ARTIFACT_NAME: ${{ inputs.artifact-name }}
+    steps:
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            report|enforce) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected 'report' or 'enforce')"; exit 1 ;;
+          esac
+          # https only; no userinfo ('@'), no fragment, no whitespace or shell/quote characters.
+          url_re='^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%/-]*)?([?][A-Za-z0-9._~%=&/-]*)?$'
+          if [ "${#TARGET_URL}" -gt 2048 ] || ! grep -Eq "$url_re" <<< "$TARGET_URL"; then
+            echo "::error::target-url must be an https URL without credentials, fragment or special characters: '${TARGET_URL//[^A-Za-z0-9._:\/?=&%~@#-]/?}'"
+            exit 1
+          fi
+          case "$RULES_FILE" in
+            "") ;;
+            /*|*..*) echo "::error::rules-file must be relative to the repository root and must not contain '..'"; exit 1 ;;
+            *)
+              if ! grep -Eq '^[A-Za-z0-9._/-]+$' <<< "$RULES_FILE"; then
+                echo "::error::rules-file may only contain letters, digits, '.', '_', '-' and '/'"
+                exit 1
+              fi ;;
+          esac
+          if ! grep -Eq '^[A-Za-z0-9_.-]{1,64}$' <<< "$ARTIFACT_NAME"; then
+            echo "::error::artifact-name must be 1-64 characters of letters, digits, '_', '.' or '-'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check rules file and clear stale reports
+        id: prepare
+        run: |
+          set -euo pipefail
+          if [ -n "$RULES_FILE" ] && [ ! -f "$GITHUB_WORKSPACE/$RULES_FILE" ]; then
+            echo "::error::rules-file '$RULES_FILE' does not exist in the repository"
+            exit 1
+          fi
+          # A committed report must never be mistaken for the result of this scan.
+          rm -f "$GITHUB_WORKSPACE/report_json.json" "$GITHUB_WORKSPACE/report_md.md" "$GITHUB_WORKSPACE/report_html.html"
+
+      - name: ZAP baseline scan
+        id: zap
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: ${{ inputs.target-url }}
+          rules_file_name: ${{ inputs.rules-file }}
+          docker_name: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6
+          fail_action: false
+          allow_issue_writing: false
+          artifact_name: ${{ inputs.artifact-name }}-zap-action
+
+      - name: Collect ZAP reports
+        id: collect
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/zap-out"
+          mkdir -p "$out"
+          for f in report_json.json report_md.md report_html.html; do
+            if [ -f "$GITHUB_WORKSPACE/$f" ]; then cp "$GITHUB_WORKSPACE/$f" "$out/$f"; fi
+          done
+
+      - name: Parse report
+        id: parse
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/zap-out/report_json.json"
+
+          # Never report zero findings when the scan produced no report.
+          if [ ! -f "$report" ]; then
+            echo "::error::ZAP report not found at $report. The scan did not run or failed to write its output; refusing to report 0 findings."
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and (.site | type == "array")' "$report" > /dev/null; then
+            echo "::error::ZAP report is not a valid ZAP JSON document; refusing to report 0 findings."
+            exit 1
+          fi
+
+          total="$(jq '[.site[]?.alerts[]?] | length' "$report")"
+          # Blocking: High risk (riskcode 3).
+          blocking="$(jq '[.site[]?.alerts[]? | select((.riskcode | tostring) == "3")] | length' "$report")"
+          echo "total-count=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking-count=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        id: summary
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          TOTAL: ${{ steps.parse.outputs.total-count }}
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/zap-out/report_json.json"
+          safe_url="$(printf '%s' "$TARGET_URL" | tr -c 'A-Za-z0-9_.:/?=&%~-' '?')"
+          {
+            echo "## DAST (OWASP ZAP baseline)"
+            echo
+            echo "Target: \`$safe_url\` | Mode: \`$MODE\`"
+            echo
+            echo "| Tool | Risk | Count |"
+            echo "|---|---|---|"
+            jq -r '[.site[]?.alerts[]?] as $a
+              | ({"3": "High", "2": "Medium", "1": "Low", "0": "Informational"} | to_entries[]) as $r
+              | "| ZAP | \($r.value) | \([$a[] | select((.riskcode | tostring) == $r.key)] | length) |"' "$report"
+            echo "| ZAP | **Blocking** (High) | $BLOCKING |"
+            if [ "$TOTAL" -gt 0 ]; then
+              echo
+              echo "### Top 10 alerts"
+              echo
+              echo "| Alert | Risk | Plugin | Instances |"
+              echo "|---|---|---|---|"
+              jq -r 'def esc: gsub("(?<c>[|`])"; "\\" + .c) | gsub("[\r\n]+"; " ");
+                [.site[]?.alerts[]?]
+                | sort_by(-((.riskcode // "0") | tonumber))
+                | .[:10][]
+                | "| \((.name // "-") | tostring | esc) | \((.riskdesc // "-") | tostring | esc) | \((.pluginid // "-") | tostring | esc) | \((.count // ((.instances // []) | length)) | tostring | esc) |"' "$report"
+              if [ "$TOTAL" -gt 10 ]; then
+                echo
+                echo "_$((TOTAL - 10)) more in the \`$ARTIFACT_NAME\` artifact._"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/zap-out/
+          if-no-files-found: error
+
+      - name: Enforce policy
+        id: enforce
+        if: ${{ !cancelled() && steps.parse.outcome == 'success' }}
+        env:
+          BLOCKING: ${{ steps.parse.outputs.blocking-count }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "enforce" ] && [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::$BLOCKING blocking finding(s): High-risk ZAP alerts. See the job summary and the report artifact."
+            exit 1
+          fi
+          echo "Mode '$MODE': $BLOCKING blocking finding(s)."

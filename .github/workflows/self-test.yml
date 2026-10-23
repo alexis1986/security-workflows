@@ -267,6 +267,34 @@ jobs:
           esac
           exit "$fail"
 
+  # ------------------------------------------------------------------- dast
+  # Public target, report mode: the call must produce a ZAP report. The parse
+  # step fails when the report is missing, so a numeric total-count proves a
+  # report was written and parsed. No finding count is asserted: the result
+  # depends on a third-party site.
+  call-dast:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dast.yml
+    with:
+      mode: report
+      target-url: https://example.com
+      artifact-name: dast-report-example
+
+  assert-dast:
+    needs: [call-dast]
+    runs-on: ubuntu-latest
+    env:
+      TOTAL: ${{ needs.call-dast.outputs.total-count }}
+      BLOCKING: ${{ needs.call-dast.outputs.blocking-count }}
+    steps:
+      - name: Assert a report was produced
+        run: |
+          set -euo pipefail
+          echo "total-count: '$TOTAL', blocking-count: '$BLOCKING'"
+          case "$TOTAL" in ''|*[!0-9]*) echo "::error::DAST did not produce a parsed report (total-count '$TOTAL')"; exit 1 ;; esac
+          case "$BLOCKING" in ''|*[!0-9]*) echo "::error::DAST blocking-count is not numeric"; exit 1 ;; esac
+
   # Failure-path tests for the scripts embedded in each reusable workflow. The
   # scripts are extracted by step id and run with simulated inputs.
   test-scripts:
@@ -591,5 +619,62 @@ jobs:
           expect yes "image: sarif-paths runs" env RUNNER_TEMP="$work/is" RESOLVED_DOCKERFILE=svc/Dockerfile bash "$work/image-sarif-paths.sh"
           got="$(jq -c '[.runs[0].results[] | .locations[0].physicalLocation.artifactLocation]' "$work/is/trivy-out/trivy.sarif")"
           if [ "$got" = '[{"uri":"svc/Dockerfile"},{"uri":"svc/Dockerfile"}]' ]; then echo "ok   - image: sarif locations point at the Dockerfile"; else echo "::error::FAIL - image: sarif locations are $got"; failures=$((failures + 1)); fi
+
+          # ------------------------------------------------------------- dast
+          # 3 alerts: High (blocking), Medium, Low. riskcode is a string in real ZAP reports.
+          zap_findings='{"site":[{"@name":"https://x","alerts":[
+            {"pluginid":"1","name":"a","riskcode":"3","riskdesc":"High (Medium)","count":"2"},
+            {"pluginid":"2","name":"b","riskcode":"2","riskdesc":"Medium (High)","count":"1"},
+            {"pluginid":"3","name":"c","riskcode":"1","riskdesc":"Low (High)","count":"1"}]}]}'
+          check_layer dast.yml zap zap-out report_json.json \
+            '{"error": true}' '{"site":[{"@name":"https://x","alerts":[]}]}' "$zap_findings" 1 3
+          extract dast.yml zap validate
+          extract dast.yml zap prepare
+          dv="$work/zap-validate.sh"
+          expect yes "dast: validate accepts an https target" env MODE=report TARGET_URL=https://example.com RULES_FILE= ARTIFACT_NAME=dast-report bash "$dv"
+          expect yes "dast: validate accepts host, port, path and query" env MODE=enforce TARGET_URL='https://staging.example.com:8443/app/v1?a=b&c=d' RULES_FILE=.zap/rules.tsv ARTIFACT_NAME=dast-report bash "$dv"
+          expect no  "dast: validate rejects an invalid mode" env MODE=bogus TARGET_URL=https://example.com RULES_FILE= ARTIFACT_NAME=dast-report bash "$dv"
+          for bad in "http://example.com" "ftp://example.com" "example.com" "https://" "https://user:pw@example.com" "https://user@example.com" "https://example.com/a b" "https://example.com/\$(id)" 'https://example.com;id' "https://example.com/#frag" "https://example.com/'x" "https://-bad.example.com" ""; do
+            expect no "dast: validate rejects target-url '$bad'" env MODE=report TARGET_URL="$bad" RULES_FILE= ARTIFACT_NAME=dast-report bash "$dv"
+          done
+          for bad in "/etc/zap.tsv" "../zap.tsv" "a/../b.tsv" 'rules;id' "rules file.tsv"; do
+            expect no "dast: validate rejects rules-file '$bad'" env MODE=report TARGET_URL=https://example.com RULES_FILE="$bad" ARTIFACT_NAME=dast-report bash "$dv"
+          done
+          expect no  "dast: validate rejects an invalid artifact-name" env MODE=report TARGET_URL=https://example.com RULES_FILE= ARTIFACT_NAME='a/b' bash "$dv"
+          mkdir -p "$work/dws"; echo x > "$work/dws/report_json.json"
+          expect no  "dast: prepare fails when rules-file does not exist" env GITHUB_WORKSPACE="$work/dws" RULES_FILE=missing.tsv bash "$work/zap-prepare.sh"
+          expect yes "dast: prepare accepts an empty rules-file" env GITHUB_WORKSPACE="$work/dws" RULES_FILE= bash "$work/zap-prepare.sh"
+          if [ -e "$work/dws/report_json.json" ]; then echo "::error::FAIL - dast: prepare left a stale report in the workspace"; failures=$((failures + 1)); else echo "ok   - dast: prepare removes stale reports"; fi
+
+          # ---------------------------------------------------------- sign-sbom
+          extract sign-sbom.yml sign validate
+          sv="$work/sign-validate.sh"
+          digest="sha256:$(printf 'a%.0s' $(seq 1 64))"
+          good="ghcr.io/owner/app@$digest"
+          sbase=(ARTIFACT_NAME=sbom TLOG_UPLOAD=true HAS_KEY=false)
+          expect yes "sign: validate accepts keyless with a digest reference" env "${sbase[@]}" SIGNING=keyless IMAGE_REF="$good" bash "$sv"
+          expect yes "sign: validate accepts a nested repository path" env "${sbase[@]}" SIGNING=keyless IMAGE_REF="ghcr.io/owner/team/app.v2@$digest" bash "$sv"
+          expect yes "sign: validate accepts key mode with the secret present" env ARTIFACT_NAME=sbom TLOG_UPLOAD=true HAS_KEY=true SIGNING=key IMAGE_REF="$good" bash "$sv"
+          expect yes "sign: validate accepts key mode without the tlog" env ARTIFACT_NAME=sbom TLOG_UPLOAD=false HAS_KEY=true SIGNING=key IMAGE_REF="$good" bash "$sv"
+          expect no  "sign: validate rejects key mode without the secret" env "${sbase[@]}" SIGNING=key IMAGE_REF="$good" bash "$sv"
+          expect no  "sign: validate rejects keyless without the transparency log" env ARTIFACT_NAME=sbom TLOG_UPLOAD=false HAS_KEY=false SIGNING=keyless IMAGE_REF="$good" bash "$sv"
+          expect no  "sign: validate rejects an invalid signing mode" env "${sbase[@]}" SIGNING=bogus IMAGE_REF="$good" bash "$sv"
+          expect no  "sign: validate rejects an invalid tlog-upload" env ARTIFACT_NAME=sbom TLOG_UPLOAD=maybe HAS_KEY=false SIGNING=keyless IMAGE_REF="$good" bash "$sv"
+          expect no  "sign: validate rejects an invalid artifact-name" env ARTIFACT_NAME='a b' TLOG_UPLOAD=true HAS_KEY=false SIGNING=keyless IMAGE_REF="$good" bash "$sv"
+          short="sha256:$(printf 'a%.0s' $(seq 1 63))"
+          for bad in "ghcr.io/owner/app:latest" "ghcr.io/owner/app" "ghcr.io/owner/app:latest@$digest" "ghcr.io/owner/app@$short" "ghcr.io/owner/app@sha256:$(printf 'A%.0s' $(seq 1 64))" "ghcr.io/owner/app@sha512:$(printf 'a%.0s' $(seq 1 64))" "ghcr.io/app@$digest" "ghcr.io/Owner/app@$digest" "docker.io/owner/app@$digest" "localhost:5000/owner/app@$digest" "owner/app@$digest" "https://ghcr.io/owner/app@$digest" "ghcr.io/owner/app@$digest;id" "ghcr.io/owner/app@$digest extra" "ghcr.io//app@$digest" ""; do
+            expect no "sign: validate rejects image-ref '$bad'" env "${sbase[@]}" SIGNING=keyless IMAGE_REF="$bad" bash "$sv"
+          done
+          # The key must come from the environment and never be printed or written to disk.
+          sign_key_run="$(yq '.jobs.sign.steps[] | select(.id == "sign-key") | .run' .github/workflows/sign-sbom.yml)"
+          case "$sign_key_run" in
+            *"--key env://COSIGN_PRIVATE_KEY"*) echo "ok   - sign: key mode reads the key through env://" ;;
+            *) echo "::error::FAIL - sign: key mode does not use env://COSIGN_PRIVATE_KEY"; failures=$((failures + 1)) ;;
+          esac
+          if grep -Eq 'echo[^#]*COSIGN_(PRIVATE_KEY|PASSWORD)|printf[^#]*COSIGN_(PRIVATE_KEY|PASSWORD)|>[^&]*cosign[.]key' <<< "$sign_key_run"; then
+            echo "::error::FAIL - sign: key mode prints or writes key material"; failures=$((failures + 1))
+          else
+            echo "ok   - sign: key mode neither prints nor writes key material"
+          fi
 
           exit "$failures"
