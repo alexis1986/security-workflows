@@ -66,6 +66,12 @@ fork pull requests and Dependabot runs; a failed upload only emits a warning).
 `packages: write` is used to push to ghcr.io. `id-token: write` is used for
 keyless signing; it must be granted even with `signing: key`.
 
+## Triggers
+
+Do not call these reusable workflows from a `pull_request_target` workflow: the
+checkout would scan the base commit instead of the proposed change, and the
+run would have a privileged token. Use `pull_request` and `push`.
+
 ## Blocking policy
 
 `mode: report` (the default) never fails on findings. `mode: enforce` fails the
@@ -151,8 +157,8 @@ jobs:
 ```
 
 Runs Semgrep Community Edition with the rule sources listed in `rulesets`
-(registry packs or rule files in the repository; default `p/typescript p/java
-p/owasp-top-ten`). The SARIF includes every severity. A warning is emitted when
+(registry packs, https URLs or rule files in the repository; default
+`p/typescript p/java p/owasp-top-ten`). The SARIF includes every severity. A warning is emitted when
 Semgrep returns partial results. Exceptions go in a `.semgrepignore` at the
 repository root. Metrics are disabled.
 
@@ -228,7 +234,10 @@ optimisation; correctness does not depend on it. In the SARIF every alert is
 attached to the Dockerfile, since image findings have no source location. The
 optional secret `build-args` takes multiline `KEY=VALUE` build arguments; it is
 masked and never echoed. Build arguments end up in the image history, so keep
-truly confidential values out of them (use BuildKit secret mounts). Fork pull
+truly confidential values out of them (use BuildKit secret mounts). The image
+configuration (`Metadata.ImageConfig`, with ENV and build history) is stripped
+from the Trivy report before parsing, SARIF and upload, so build-arg and ENV
+values do not reach the report artifact. Fork pull
 requests do not receive secrets, so their build runs without `build-args`.
 `context` defaults to `scan-path`; `dockerfile` defaults to `<context>/Dockerfile`.
 

@@ -243,3 +243,4 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/sbom-out/sbom.cdx.json
           if-no-files-found: error
+          overwrite: true

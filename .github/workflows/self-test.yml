@@ -89,6 +89,34 @@ jobs:
           esac
           exit "$fail"
 
+  # This repository's own history: dogfoods the root .gitleaks.toml (fixtures
+  # are allowlisted) and uploads SARIF to code scanning (skipped on fork and
+  # Dependabot PRs by the reusable workflow).
+  call-secrets-repo:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/secrets.yml
+    with:
+      mode: report
+      scan-path: .
+      upload-sarif: true
+      artifact-name: secrets-report-repo
+
+  assert-secrets-repo:
+    needs: [call-secrets-repo]
+    runs-on: ubuntu-latest
+    env:
+      REPO_BLOCKING: ${{ needs.call-secrets-repo.outputs.blocking-count }}
+    steps:
+      - name: Assert no secrets in the repository
+        run: |
+          set -euo pipefail
+          echo "repository blocking-count: '$REPO_BLOCKING' (expected 0)"
+          case "$REPO_BLOCKING" in ''|*[!0-9]*) echo "::error::repository blocking-count is not numeric"; exit 1 ;;
+            *) [ "$REPO_BLOCKING" -eq 0 ] || { echo "::error::Gitleaks found secrets in this repository"; exit 1; } ;;
+          esac
+
   # -------------------------------------------------------------------- sca
   call-sca-vulnerable:
     permissions:
@@ -174,6 +202,19 @@ jobs:
             *) [ "$CLEAN_BLOCKING" -eq 0 ] || { echo "::error::Semgrep reported findings in the clean fixture"; fail=1; } ;;
           esac
           exit "$fail"
+
+  # This repository's own workflows: dogfoods the GitHub Actions ruleset.
+  call-sast-workflows:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/sast.yml
+    with:
+      mode: report
+      scan-path: .github
+      rulesets: p/github-actions
+      upload-sarif: true
+      artifact-name: sast-report-workflows
 
   # -------------------------------------------------------------------- iac
   call-iac-vulnerable:
@@ -308,6 +349,8 @@ jobs:
           set -euo pipefail
           work="$(mktemp -d)"
           failures=0
+          # Default for every validate script; individual cases override it.
+          export ARTIFACT_NAME=report
 
           # extract <workflow-file> <job-id> <step-id> -> $work/<job-id>-<step-id>.sh
           extract() {
@@ -387,6 +430,9 @@ jobs:
             expect no  "$job: validate rejects an absolute scan-path" env MODE=report SCAN_PATH=/etc "$@" bash "$script"
             expect no  "$job: validate rejects a scan-path with '..'" env MODE=report SCAN_PATH=../x "$@" bash "$script"
             expect no  "$job: validate rejects an empty scan-path" env MODE=report SCAN_PATH= "$@" bash "$script"
+            for bad_name in "" "a/b" "a b" "../x" 'a;id' "$(printf 'a%.0s' $(seq 1 65))"; do
+              expect no  "$job: validate rejects artifact-name '$bad_name'" env MODE=report SCAN_PATH=. ARTIFACT_NAME="$bad_name" "$@" bash "$script"
+            done
           }
 
           # ------------------------------------------------------------ secrets
@@ -619,6 +665,26 @@ jobs:
           expect yes "image: sarif-paths runs" env RUNNER_TEMP="$work/is" RESOLVED_DOCKERFILE=svc/Dockerfile bash "$work/image-sarif-paths.sh"
           got="$(jq -c '[.runs[0].results[] | .locations[0].physicalLocation.artifactLocation]' "$work/is/trivy-out/trivy.sarif")"
           if [ "$got" = '[{"uri":"svc/Dockerfile"},{"uri":"svc/Dockerfile"}]' ]; then echo "ok   - image: sarif locations point at the Dockerfile"; else echo "::error::FAIL - image: sarif locations are $got"; failures=$((failures + 1)); fi
+
+          # Build-arg/ENV values must not survive in the image report.
+          extract image-scan.yml image strip
+          mkdir -p "$work/st/trivy-out"
+          cat > "$work/st/trivy-out/trivy.json" <<'JSON'
+          {"SchemaVersion":2,"Metadata":{"OS":{"Family":"alpine"},"ImageConfig":{"config":{"Env":["API_TOKEN=not-a-real-secret-0123456789"]},"history":[{"created_by":"ARG TOKEN=not-a-real-secret-0123456789"}]}},"Results":[{"Target":"app","Vulnerabilities":[{"VulnerabilityID":"CVE-1","Severity":"HIGH"}]}]}
+          JSON
+          expect yes "image: strip step runs" env RUNNER_TEMP="$work/st" bash "$work/image-strip.sh"
+          if grep -q "not-a-real-secret" "$work/st/trivy-out/trivy.json" || [ "$(jq '.Metadata | has("ImageConfig")' "$work/st/trivy-out/trivy.json")" != false ]; then
+            echo "::error::FAIL - image: Metadata.ImageConfig survived in the report"; failures=$((failures + 1))
+          else
+            echo "ok   - image: Metadata.ImageConfig (Env, history) is removed from the report"
+          fi
+          if [ "$(jq -c '[.Metadata.OS.Family, .Results[0].Vulnerabilities[0].VulnerabilityID]' "$work/st/trivy-out/trivy.json")" = '["alpine","CVE-1"]' ]; then
+            echo "ok   - image: strip keeps the rest of the report"
+          else
+            echo "::error::FAIL - image: strip altered other report fields"; failures=$((failures + 1))
+          fi
+          echo 'not json' > "$work/st/trivy-out/trivy.json"
+          expect no  "image: strip fails closed on an unreadable report" env RUNNER_TEMP="$work/st" bash "$work/image-strip.sh"
 
           # ------------------------------------------------------------- dast
           # 3 alerts: High (blocking), Medium, Low. riskcode is a string in real ZAP reports.

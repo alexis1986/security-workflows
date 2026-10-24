@@ -12,6 +12,9 @@ name: image-scan
 # - Ignore file: by default the consumer's '.trivyignore' inside the build
 #   context is used when it exists, otherwise the one at the repository root
 #   (see `ignore-path`). Give every entry a comment with the reason and an expiry.
+# - Privacy: the image configuration (`Metadata.ImageConfig`, which holds ENV and
+#   build history) is removed from the report before parsing, SARIF and upload,
+#   so build-arg/ENV values never reach the artifact.
 # - SARIF: image findings have no source location, so every alert is attached
 #   to the Dockerfile (repository-relative path) to show up in code scanning.
 #
@@ -150,6 +153,7 @@ jobs:
     env:
       TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c # v0.76.1
       MODE: ${{ inputs.mode }}
+      ARTIFACT_NAME: ${{ inputs.artifact-name }}
       SCAN_PATH: ${{ inputs.scan-path }}
       IGNORE_PATH: ${{ inputs.ignore-path }}
       CONTEXT: ${{ inputs.context }}
@@ -203,6 +207,10 @@ jobs:
           done <<< "$PUSH_TAGS"
           if [ "$PUSH" = "true" ] && [ "$count" -eq 0 ]; then
             echo "::error::push-tags must list at least one image reference when push is true"
+            exit 1
+          fi
+          if ! grep -Eq '^[A-Za-z0-9_.-]{1,64}$' <<< "$ARTIFACT_NAME"; then
+            echo "::error::artifact-name must be 1-64 characters of letters, digits, '_', '.' or '-'"
             exit 1
           fi
 
@@ -291,7 +299,6 @@ jobs:
       - name: Run Trivy
         id: scan
         env:
-          SARIF_ENABLED: ${{ steps.sarif.outputs.enabled }}
           RESOLVED_CONTEXT: ${{ steps.resolve.outputs.context }}
         run: |
           set -euo pipefail
@@ -336,17 +343,32 @@ jobs:
             --format json \
             --output /out/trivy.json
 
-          if [ "$SARIF_ENABLED" = "true" ]; then
-            # SARIF from the same scan (no second run). Same content policy as the
-            # JSON report: every severity is uploaded.
-            docker run --rm \
-              -v "$out:/out" \
-              "$TRIVY_IMAGE" \
-              convert \
-              --format sarif \
-              --output /out/trivy.sarif \
-              /out/trivy.json
-          fi
+      - name: Strip image configuration from the report
+        id: strip
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/trivy-out/trivy.json"
+          # The image configuration (ENV, build history) can contain build-arg and
+          # ENV values. Remove it before the report is parsed, converted or uploaded.
+          # Fail closed: if the report cannot be rewritten the job stops here.
+          tmp="$report.tmp"
+          jq 'del(.Metadata.ImageConfig)' "$report" > "$tmp"
+          mv "$tmp" "$report"
+
+      - name: Convert report to SARIF
+        id: sarif-convert
+        if: ${{ steps.sarif.outputs.enabled == 'true' }}
+        run: |
+          set -euo pipefail
+          # SARIF from the same scan (no second run). Same content policy as the
+          # JSON report: every severity is uploaded.
+          docker run --rm \
+            -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" \
+            convert \
+            --format sarif \
+            --output /out/trivy.sarif \
+            /out/trivy.json
 
       - name: Point SARIF locations at the Dockerfile
         id: sarif-paths
@@ -438,6 +460,7 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/trivy-out/
           if-no-files-found: error
+          overwrite: true
 
       - name: Upload SARIF to code scanning
         id: upload-sarif

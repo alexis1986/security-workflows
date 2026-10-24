@@ -209,6 +209,7 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/zap-out/
           if-no-files-found: error
+          overwrite: true
 
       - name: Enforce policy
         id: enforce

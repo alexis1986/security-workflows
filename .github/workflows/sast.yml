@@ -67,6 +67,7 @@ jobs:
     env:
       SEMGREP_IMAGE: semgrep/semgrep:1.182.0@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af # v1.182.0
       MODE: ${{ inputs.mode }}
+      ARTIFACT_NAME: ${{ inputs.artifact-name }}
       SCAN_PATH: ${{ inputs.scan-path }}
       RULESETS: ${{ inputs.rulesets }}
     steps:
@@ -96,6 +97,10 @@ jobs:
               exit 1
             fi
           done
+          if ! grep -Eq '^[A-Za-z0-9_.-]{1,64}$' <<< "$ARTIFACT_NAME"; then
+            echo "::error::artifact-name must be 1-64 characters of letters, digits, '_', '.' or '-'"
+            exit 1
+          fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -239,6 +244,7 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ runner.temp }}/semgrep-out/
           if-no-files-found: error
+          overwrite: true
 
       - name: Upload SARIF to code scanning
         id: upload-sarif
