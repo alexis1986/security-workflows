@@ -48,6 +48,10 @@ on:
         description: "Resolve Maven dependencies into ~/.m2 first (setup-java cache + dependency:resolve) so Trivy reads POMs locally instead of fetching each one from Maven Central. Runs the consumer's Maven wrapper"
         type: boolean
         default: false
+      maven-install:
+        description: "Space-separated repo-relative Maven module dirs to `install` (tests skipped) before resolving scan-path, for local artifacts that are not on Maven Central (e.g. a sibling module). Requires maven-cache"
+        type: string
+        default: ""
       java-version:
         description: "JDK (Corretto) used when maven-cache is enabled"
         type: string
@@ -79,6 +83,7 @@ jobs:
       SCAN_PATH: ${{ inputs.scan-path }}
       IGNORE_PATH: ${{ inputs.ignore-path }}
       MAVEN_CACHE: ${{ inputs.maven-cache }}
+      MAVEN_INSTALL: ${{ inputs.maven-install }}
     steps:
       - name: Validate inputs
         id: validate
@@ -98,6 +103,21 @@ jobs:
           if ! grep -Eq '^[A-Za-z0-9_.-]{1,64}$' <<< "$ARTIFACT_NAME"; then
             echo "::error::artifact-name must be 1-64 characters of letters, digits, '_', '.' or '-'"
             exit 1
+          fi
+          if [ -n "${MAVEN_INSTALL:-}" ]; then
+            if [ "${MAVEN_CACHE:-}" != "true" ]; then
+              echo "::error::maven-install requires maven-cache: true"
+              exit 1
+            fi
+            for m in $MAVEN_INSTALL; do
+              case "$m" in
+                /*|*..*) echo "::error::maven-install entries must be relative to the repository root and must not contain '..'"; exit 1 ;;
+              esac
+              if ! grep -Eq '^[A-Za-z0-9_./-]+$' <<< "$m"; then
+                echo "::error::Invalid maven-install entry '$m'"
+                exit 1
+              fi
+            done
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,6 +145,16 @@ jobs:
             exit 1
           fi
           if [ -x mvnw ]; then mvn=./mvnw; else mvn=mvn; fi
+          # Local modules first: their artifacts are not on Maven Central.
+          for m in $MAVEN_INSTALL; do
+            if [ ! -f "$GITHUB_WORKSPACE/$m/pom.xml" ]; then
+              echo "::error::maven-install entry '$m' has no pom.xml"
+              exit 1
+            fi
+            # Runner Maven, not the wrapper: a wrapper resolves its config from
+            # its own project, which may not be this module's.
+            mvn -B -q -f "$GITHUB_WORKSPACE/$m/pom.xml" install -DskipTests
+          done
           "$mvn" -B -q dependency:resolve
 
       - name: Decide SARIF
