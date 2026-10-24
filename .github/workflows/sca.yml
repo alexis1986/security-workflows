@@ -44,6 +44,14 @@ on:
         description: "Trivy ignore file relative to the repository root. Empty: use .trivyignore in scan-path, else at the root, if present. 'none': ignore any .trivyignore"
         type: string
         default: ""
+      maven-cache:
+        description: "Resolve Maven dependencies into ~/.m2 first (setup-java cache + dependency:resolve) so Trivy reads POMs locally instead of fetching each one from Maven Central. Runs the consumer's Maven wrapper"
+        type: boolean
+        default: false
+      java-version:
+        description: "JDK (Corretto) used when maven-cache is enabled"
+        type: string
+        default: "21"
     outputs:
       blocking-count:
         description: "Number of CRITICAL/HIGH vulnerabilities with a fix available"
@@ -70,6 +78,7 @@ jobs:
       ARTIFACT_NAME: ${{ inputs.artifact-name }}
       SCAN_PATH: ${{ inputs.scan-path }}
       IGNORE_PATH: ${{ inputs.ignore-path }}
+      MAVEN_CACHE: ${{ inputs.maven-cache }}
     steps:
       - name: Validate inputs
         id: validate
@@ -94,6 +103,29 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Trivy fetches every Maven parent/BOM/transitive POM from Maven Central one
+      # request at a time, and Central rate-limits GitHub runner IPs (429). Maven
+      # resolves them once (cached across runs) and Trivy reads ~/.m2 instead.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        if: ${{ inputs.maven-cache }}
+        with:
+          distribution: corretto
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+          cache-dependency-path: ${{ inputs.scan-path }}/**/pom.xml
+
+      - name: Resolve Maven dependencies
+        if: ${{ inputs.maven-cache }}
+        working-directory: ${{ inputs.scan-path }}
+        run: |
+          set -euo pipefail
+          if [ ! -f pom.xml ]; then
+            echo "::error::maven-cache is enabled but '$SCAN_PATH' has no pom.xml"
+            exit 1
+          fi
+          if [ -x mvnw ]; then mvn=./mvnw; else mvn=mvn; fi
+          "$mvn" -B -q dependency:resolve
 
       - name: Decide SARIF
         id: sarif
@@ -150,10 +182,15 @@ jobs:
           # Debug output is captured because Trivy only logs Maven resolution
           # failures (unresolvable parents/BOMs) at debug level; everything that is
           # not DEBUG is still shown in this step's log.
+          m2=()
+          if [ "$MAVEN_CACHE" = "true" ]; then
+            m2=(-v "$HOME/.m2:/root/.m2:ro")
+          fi
           rc=0
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
             -v "$out:/out" \
+            "${m2[@]}" \
             "$TRIVY_IMAGE" \
             fs \
             --scanners vuln \
