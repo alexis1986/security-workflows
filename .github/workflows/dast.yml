@@ -15,6 +15,11 @@ name: dast
 #   configuration file (tab-separated: rule id, IGNORE|INFO|WARN|FAIL, comment).
 #   Use it for exceptions and give every entry a reason and an expiry in the
 #   comment column, for example `10020<TAB>IGNORE<TAB>(reason - expires 2026-12-31)`.
+# - `wait-for` (optional) makes the scan wait until the deployed application
+#   serves that exact text at `wait-url` (for example the commit SHA baked into
+#   the image as /version.txt), polling every 15 s for up to
+#   `wait-timeout-minutes`. On timeout it emits a warning and scans whatever is
+#   live: the wait never fails the job. Leave `wait-for` empty to scan right away.
 # - Artifacts: `artifact-name` holds the parsed reports (JSON, Markdown, HTML).
 #   The ZAP action also uploads its own copy as `<artifact-name>-zap-action`.
 # - Common interface: `mode`, `artifact-name`, outputs `blocking-count` and
@@ -25,10 +30,12 @@ name: dast
 #     dast:
 #       permissions:
 #         contents: read
-#       uses: <owner>/security-workflows/.github/workflows/dast.yml@main
+#       uses: <owner>/security-workflows/.github/workflows/dast.yml@v1.0.0
 #       with:
 #         mode: enforce
 #         target-url: https://staging.example.com
+#         wait-url: https://staging.example.com/version.txt
+#         wait-for: ${{ github.sha }}
 #
 # Permissions: only `contents: read` (to read `rules-file`).
 
@@ -51,6 +58,18 @@ on:
         description: "Name of the uploaded report artifact. Must be unique per run when the workflow is called more than once"
         type: string
         default: dast-report
+      wait-url:
+        description: "Optional https URL whose body is compared with wait-for before scanning"
+        type: string
+        default: ""
+      wait-for:
+        description: "Optional exact text (letters, digits, '.', '_', '-') to wait for at wait-url. Empty: no wait"
+        type: string
+        default: ""
+      wait-timeout-minutes:
+        description: "Maximum wait for wait-for, 1-30 minutes; then the scan runs anyway with a warning"
+        type: number
+        default: 10
     outputs:
       blocking-count:
         description: "Number of High-risk alerts"
@@ -65,6 +84,7 @@ permissions:
 jobs:
   zap:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     outputs:
@@ -76,6 +96,9 @@ jobs:
       TARGET_URL: ${{ inputs.target-url }}
       RULES_FILE: ${{ inputs.rules-file }}
       ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      WAIT_URL: ${{ inputs.wait-url }}
+      WAIT_FOR: ${{ inputs.wait-for }}
+      WAIT_TIMEOUT_MINUTES: ${{ inputs.wait-timeout-minutes }}
     steps:
       - name: Validate inputs
         id: validate
@@ -104,6 +127,44 @@ jobs:
             echo "::error::artifact-name must be 1-64 characters of letters, digits, '_', '.' or '-'"
             exit 1
           fi
+          if [ -n "${WAIT_FOR:-}" ]; then
+            if ! grep -Eq '^[A-Za-z0-9_.-]{1,128}$' <<< "$WAIT_FOR"; then
+              echo "::error::wait-for must be 1-128 characters of letters, digits, '_', '.' or '-'"
+              exit 1
+            fi
+            if [ "${#WAIT_URL}" -gt 2048 ] || ! grep -Eq "$url_re" <<< "${WAIT_URL:-}"; then
+              echo "::error::wait-for requires wait-url, an https URL without credentials, fragment or special characters"
+              exit 1
+            fi
+            if ! grep -Eq '^[0-9]{1,2}$' <<< "${WAIT_TIMEOUT_MINUTES:-}" || [ "$WAIT_TIMEOUT_MINUTES" -lt 1 ] || [ "$WAIT_TIMEOUT_MINUTES" -gt 30 ]; then
+              echo "::error::wait-timeout-minutes must be an integer between 1 and 30"
+              exit 1
+            fi
+          fi
+
+      - name: Wait for the deployed version
+        id: wait
+        run: |
+          set -euo pipefail
+          if [ -z "${WAIT_FOR:-}" ]; then
+            echo "No wait-for given: scanning what is live."
+            exit 0
+          fi
+          # WAIT_INTERVAL_SECONDS and WAIT_TIMEOUT_SECONDS only exist so self-test can run this quickly.
+          interval="${WAIT_INTERVAL_SECONDS:-15}"
+          deadline=$(( $(date +%s) + ${WAIT_TIMEOUT_SECONDS:-$(( WAIT_TIMEOUT_MINUTES * 60 ))} ))
+          while :; do
+            body="$(curl -fsS --max-time 10 "$WAIT_URL" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [ "$body" = "$WAIT_FOR" ]; then
+              echo "Deployed version is $WAIT_FOR."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::warning::$WAIT_URL did not serve $WAIT_FOR within $WAIT_TIMEOUT_MINUTES min; scanning the version that is live"
+              exit 0
+            fi
+            sleep "$interval"
+          done
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

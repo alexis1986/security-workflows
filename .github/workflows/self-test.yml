@@ -711,6 +711,42 @@ jobs:
           expect no  "dast: prepare fails when rules-file does not exist" env GITHUB_WORKSPACE="$work/dws" RULES_FILE=missing.tsv bash "$work/zap-prepare.sh"
           expect yes "dast: prepare accepts an empty rules-file" env GITHUB_WORKSPACE="$work/dws" RULES_FILE= bash "$work/zap-prepare.sh"
           if [ -e "$work/dws/report_json.json" ]; then echo "::error::FAIL - dast: prepare left a stale report in the workspace"; failures=$((failures + 1)); else echo "ok   - dast: prepare removes stale reports"; fi
+          sha="$(printf 'ab%.0s' $(seq 1 20))"
+          vbase=(MODE=report TARGET_URL=https://example.com RULES_FILE= ARTIFACT_NAME=dast-report)
+          expect yes "dast: validate accepts wait-url with a commit sha" env "${vbase[@]}" WAIT_URL=https://example.com/version.txt WAIT_FOR="$sha" WAIT_TIMEOUT_MINUTES=15 bash "$dv"
+          expect yes "dast: validate accepts no wait" env "${vbase[@]}" WAIT_URL= WAIT_FOR= WAIT_TIMEOUT_MINUTES=10 bash "$dv"
+          expect no  "dast: validate rejects an http wait-url" env "${vbase[@]}" WAIT_URL=http://example.com/version.txt WAIT_FOR="$sha" WAIT_TIMEOUT_MINUTES=10 bash "$dv"
+          expect no  "dast: validate rejects wait-for without wait-url" env "${vbase[@]}" WAIT_URL= WAIT_FOR="$sha" WAIT_TIMEOUT_MINUTES=10 bash "$dv"
+          for bad in 'abc;id' 'a b' "\$(id)" "a'b"; do
+            expect no "dast: validate rejects wait-for '$bad'" env "${vbase[@]}" WAIT_URL=https://example.com/version.txt WAIT_FOR="$bad" WAIT_TIMEOUT_MINUTES=10 bash "$dv"
+          done
+          for bad in 0 31 x ''; do
+            expect no "dast: validate rejects wait-timeout-minutes '$bad'" env "${vbase[@]}" WAIT_URL=https://example.com/version.txt WAIT_FOR="$sha" WAIT_TIMEOUT_MINUTES="$bad" bash "$dv"
+          done
+
+          # wait: polls wait-url until its body equals wait-for; on timeout it warns and lets the scan run.
+          extract dast.yml zap wait
+          dw="$work/zap-wait.sh"
+          mkdir -p "$work/www"; echo abc123 > "$work/www/version.txt"
+          python3 -m http.server 18765 --bind 127.0.0.1 --directory "$work/www" > /dev/null 2>&1 &
+          srv=$!
+          for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:18765/version.txt 2>/dev/null && break; sleep 0.1; done
+          wbase=(WAIT_URL=http://127.0.0.1:18765/version.txt WAIT_INTERVAL_SECONDS=1)
+          expect yes "dast: wait returns when the deployed version matches" env "${wbase[@]}" WAIT_FOR=abc123 WAIT_TIMEOUT_MINUTES=1 bash "$dw"
+          expect yes "dast: wait is a no-op without wait-for" env WAIT_URL= WAIT_FOR= WAIT_TIMEOUT_MINUTES=10 bash "$dw"
+          echo old > "$work/www/version.txt"
+          started=$(date +%s)
+          expect yes "dast: wait continues after the timeout" env "${wbase[@]}" WAIT_FOR=abc123 WAIT_TIMEOUT_MINUTES=1 WAIT_TIMEOUT_SECONDS=3 bash "$dw"
+          elapsed=$(( $(date +%s) - started ))
+          if grep -q '^::warning::' "$work/out.log" && [ "$elapsed" -lt 20 ]; then
+            echo "ok   - dast: wait warns on timeout and stops waiting"
+          else
+            echo "::error::FAIL - dast: wait did not warn or did not stop (elapsed ${elapsed}s)"; cat "$work/out.log"; failures=$((failures + 1))
+          fi
+          kill "$srv" 2>/dev/null || true
+          started=$(date +%s)
+          expect yes "dast: wait tolerates an unreachable wait-url" env WAIT_URL=http://127.0.0.1:18765/version.txt WAIT_INTERVAL_SECONDS=1 WAIT_FOR=abc123 WAIT_TIMEOUT_MINUTES=1 WAIT_TIMEOUT_SECONDS=3 bash "$dw"
+          if [ $(( $(date +%s) - started )) -lt 20 ]; then echo "ok   - dast: wait stops on time when the target is down"; else echo "::error::FAIL - dast: wait overran its timeout"; failures=$((failures + 1)); fi
 
           # ---------------------------------------------------------- sign-sbom
           extract sign-sbom.yml sign validate
