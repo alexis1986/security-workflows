@@ -137,7 +137,14 @@ Scans the lockfiles and manifests under `scan-path` (pnpm, npm, Maven, ...).
 Maven dependencies are resolved against public Maven Central only: parents and
 BOMs from private repositories are not resolved, so the dependency list can be
 incomplete. The workflow emits a warning when Trivy reports such problems, but it
-cannot make the result complete. SARIF is produced from the same scan and
+cannot make the result complete. Maven Central also rate-limits GitHub runner
+IPs (`429 Too Many Requests`) because Trivy fetches each POM separately: set
+`maven-cache: true` (and `java-version`, default `21`) to resolve the
+dependencies with the project's Maven wrapper first, cached across runs, and
+let Trivy read them from `~/.m2`. This runs the consumer's build tool, so only
+enable it on repositories you trust. If `scan-path` depends on a module that is not on
+Maven Central (a sibling module of the same repo), list its directory in
+`maven-install` (space-separated) and it is installed into `~/.m2` first. SARIF is produced from the same scan and
 includes every severity, with paths relative to the repository root. Exceptions
 go in a `.trivyignore` inside `scan-path` or at the repository root (input
 `ignore-path` selects another file, `none` disables it).
