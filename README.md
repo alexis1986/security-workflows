@@ -9,6 +9,12 @@ way: a job summary table, a raw report artifact and numeric outputs.
 
 > Resumen en español al final de este documento.
 
+## Versioning
+
+Call the workflows by release tag (`@v1.0.0`), never by `@main`. Release tags
+are protected (no update, no deletion), so a tag always points to the code you
+reviewed; Dependabot's `github-actions` ecosystem proposes upgrades to newer tags.
+
 ## Layers
 
 | Layer | Workflow | Tool | Blocking policy (`enforce`) |
@@ -93,7 +99,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: alexis1986/security-workflows/.github/workflows/secrets.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/secrets.yml@v1.0.0
     with:
       mode: report
       artifact-name: secrets-report
@@ -126,7 +132,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: alexis1986/security-workflows/.github/workflows/sca.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sca.yml@v1.0.0
     with:
       mode: enforce
       upload-sarif: true
@@ -157,7 +163,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: alexis1986/security-workflows/.github/workflows/sast.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sast.yml@v1.0.0
     with:
       mode: report
       rulesets: "p/typescript p/java p/owasp-top-ten"
@@ -177,7 +183,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: alexis1986/security-workflows/.github/workflows/iac.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/iac.yml@v1.0.0
     with:
       mode: enforce
       upload-sarif: true
@@ -213,7 +219,7 @@ jobs:
       contents: read
       security-events: write
       packages: write
-    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@v1.0.0
     with:
       mode: enforce
       upload-sarif: true
@@ -262,7 +268,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@v1.0.0
     with:
       image-ref: ghcr.io/<owner>/my-app@${{ needs.image-scan.outputs.digest }}
       signing: keyless
@@ -306,11 +312,14 @@ jobs:
   dast:
     permissions:
       contents: read
-    uses: alexis1986/security-workflows/.github/workflows/dast.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/dast.yml@v1.0.0
     with:
       mode: report
       target-url: https://staging.example.com
       rules-file: .zap/rules.tsv   # optional
+      wait-url: https://staging.example.com/version.txt   # optional
+      wait-for: ${{ github.sha }}                          # optional
+      wait-timeout-minutes: 10                             # optional, 1-30
 ```
 
 Runs the ZAP baseline scan (passive: it spiders the target and reports what it
@@ -321,6 +330,12 @@ without credentials. `blocking-count` is the number of High-risk alerts;
 `total-count` covers every risk level. A scan that cannot reach the target or
 writes no report fails the job. Besides `artifact-name`, the ZAP action uploads its own copy of the reports as `<artifact-name>-zap-action`. The optional `rules-file` is a ZAP rules file
 (tab-separated: rule id, `IGNORE`/`INFO`/`WARN`/`FAIL`, comment).
+
+To scan the version you just deployed instead of whatever is still live, bake
+the commit SHA into the image (for example as `/version.txt`) and pass it as
+`wait-for`: the scan polls `wait-url` every 15 s until its body equals
+`wait-for`. If it does not within `wait-timeout-minutes`, the job logs a warning
+and scans the live version; the wait never fails the job.
 
 ## Pipeline examples
 
@@ -336,29 +351,29 @@ on:
 jobs:
   secrets:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/secrets.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/secrets.yml@v1.0.0
     with: { mode: enforce }
 
   sca:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/sca.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sca.yml@v1.0.0
     with: { mode: enforce, upload-sarif: true }
 
   sast:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/sast.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sast.yml@v1.0.0
     with: { mode: report, upload-sarif: true }
 
   iac:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/iac.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/iac.yml@v1.0.0
     with: { mode: enforce, scan-path: deploy }
 
   image-scan:
     needs: [secrets, sca, sast, iac]
     if: github.event_name == 'push'
     permissions: { contents: read, security-events: write, packages: write }
-    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@v1.0.0
     with:
       mode: enforce
       image-name: web
@@ -370,14 +385,14 @@ jobs:
   sign:
     needs: image-scan
     permissions: { contents: read, packages: write, id-token: write }
-    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@v1.0.0
     with:
       image-ref: ghcr.io/<owner>/web@${{ needs.image-scan.outputs.digest }}
 
   dast:
     needs: image-scan   # run after your deploy; the scan does not depend on signing
     permissions: { contents: read }
-    uses: alexis1986/security-workflows/.github/workflows/dast.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/dast.yml@v1.0.0
     with:
       mode: report
       target-url: https://staging.example.com
@@ -397,7 +412,7 @@ explicit, non-matrix `image-scan-<service>` job per service, each feeding its ow
 jobs:
   secrets:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/secrets.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/secrets.yml@v1.0.0
     with: { mode: enforce }
 
   sca:
@@ -406,7 +421,7 @@ jobs:
       matrix:
         service: [orders, billing]
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/sca.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sca.yml@v1.0.0
     with:
       mode: enforce
       scan-path: services/${{ matrix.service }}
@@ -414,18 +429,18 @@ jobs:
 
   sast:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/sast.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sast.yml@v1.0.0
     with: { mode: report, upload-sarif: true }
 
   iac:
     permissions: { contents: read, security-events: write }
-    uses: alexis1986/security-workflows/.github/workflows/iac.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/iac.yml@v1.0.0
     with: { mode: enforce, scan-path: deploy, helm-chart: deploy/chart }
 
   image-scan-orders:
     needs: [secrets, sca, sast, iac]
     permissions: { contents: read, security-events: write, packages: write }
-    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@v1.0.0
     with:
       mode: enforce
       context: services/orders
@@ -437,7 +452,7 @@ jobs:
   sign-orders:
     needs: image-scan-orders
     permissions: { contents: read, packages: write, id-token: write }
-    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@v1.0.0
     with:
       image-ref: ghcr.io/<owner>/orders@${{ needs.image-scan-orders.outputs.digest }}
       artifact-name: sbom-orders
@@ -445,7 +460,7 @@ jobs:
   image-scan-billing:
     needs: [secrets, sca, sast, iac]
     permissions: { contents: read, security-events: write, packages: write }
-    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/image-scan.yml@v1.0.0
     with:
       mode: enforce
       context: services/billing
@@ -457,7 +472,7 @@ jobs:
   sign-billing:
     needs: image-scan-billing
     permissions: { contents: read, packages: write, id-token: write }
-    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@main
+    uses: alexis1986/security-workflows/.github/workflows/sign-sbom.yml@v1.0.0
     with:
       image-ref: ghcr.io/<owner>/billing@${{ needs.image-scan-billing.outputs.digest }}
       artifact-name: sbom-billing
@@ -492,7 +507,7 @@ tie the signature to the caller's protected branch:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github\.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@refs/heads/main$' \
+  --certificate-identity-regexp '^https://github\.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-github-workflow-repository <owner>/<repo> \
   --certificate-github-workflow-ref refs/heads/main \
@@ -500,7 +515,7 @@ cosign verify \
   ghcr.io/<owner>/my-app@sha256:<digest>
 
 cosign verify-attestation --type cyclonedx \
-  --certificate-identity-regexp '^https://github\.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@refs/heads/main$' \
+  --certificate-identity-regexp '^https://github\.com/alexis1986/security-workflows/\.github/workflows/sign-sbom\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-github-workflow-repository <owner>/<repo> \
   --certificate-github-workflow-ref refs/heads/main \
@@ -508,11 +523,11 @@ cosign verify-attestation --type cyclonedx \
   ghcr.io/<owner>/my-app@sha256:<digest>
 ```
 
-The `@refs/heads/main$` suffix in the identity is the ref of the reusable
-workflow you call (`sign-sbom.yml@main`). Once you pin released versions, accept
-tags instead, for example `@refs/tags/v[0-9.]+$`. `--certificate-github-workflow-ref`
-is the ref of the repository that ran the workflow; use your release ref pattern
-(or drop the trigger flag) when you sign from tags.
+The `@refs/tags/v…$` suffix in the identity is the ref of the reusable workflow
+you call (`sign-sbom.yml@v1.0.0`); images signed while a caller still pointed at
+`@main` carry `@refs/heads/main` instead. `--certificate-github-workflow-ref` is
+the ref of the repository that ran the workflow (your `main`); use your release
+ref pattern (or drop the trigger flag) when you sign from tags.
 
 Key mode:
 

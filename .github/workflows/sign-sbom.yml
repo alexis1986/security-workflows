@@ -29,7 +29,7 @@ name: sign-sbom
 #   jobs:
 #     image-scan:
 #       permissions: { contents: read, security-events: write, packages: write }
-#       uses: <owner>/security-workflows/.github/workflows/image-scan.yml@main
+#       uses: <owner>/security-workflows/.github/workflows/image-scan.yml@v1.0.0
 #       with: { push: true, push-tags: "ghcr.io/<owner>/<repo>:latest", ... }
 #     sign:
 #       needs: image-scan
@@ -37,7 +37,7 @@ name: sign-sbom
 #         contents: read
 #         packages: write
 #         id-token: write
-#       uses: <owner>/security-workflows/.github/workflows/sign-sbom.yml@main
+#       uses: <owner>/security-workflows/.github/workflows/sign-sbom.yml@v1.0.0
 #       with:
 #         image-ref: ghcr.io/<owner>/<repo>@${{ needs.image-scan.outputs.digest }}
 #         signing: keyless

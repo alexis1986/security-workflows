@@ -36,7 +36,7 @@ name: image-scan
 #         contents: read
 #         security-events: write
 #         packages: write
-#       uses: <owner>/security-workflows/.github/workflows/image-scan.yml@main
+#       uses: <owner>/security-workflows/.github/workflows/image-scan.yml@v1.0.0
 #       with:
 #         mode: enforce
 #         image-name: my-app
